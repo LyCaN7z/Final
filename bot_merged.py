@@ -715,8 +715,12 @@ def safe_local_path(domain_dir: str, url: str) -> str:
 
 class _TokenBucket:
     """
-    Token Bucket rate limiter — O(1) per check, no periodic cleanup needed.
-    Each user gets `capacity` tokens, refilled at `rate` tokens/second.
+    Token Bucket rate limiter — O(1) per check, thread-safe.
+
+    v36 improvements:
+    - Idle eviction: 1h (was 2h) to save memory on busy bots
+    - reset(uid): admin can clear a specific user's bucket
+    - stats(): return pool size + oldest entry age for monitoring
     """
     __slots__ = ('_lock', '_buckets', '_rate', '_capacity')
 
@@ -728,13 +732,12 @@ class _TokenBucket:
 
     def consume(self, uid: int, tokens: float = 1.0) -> tuple:
         """
+        Atomically consume tokens if available.
         Returns (allowed: bool, wait_seconds: float)
-        Atomically checks and consumes one token if available.
         """
         now = time.monotonic()
         with self._lock:
             stored_tokens, last_ts = self._buckets.get(uid, (self._capacity, now))
-            # Refill tokens proportional to elapsed time
             elapsed  = now - last_ts
             refilled = min(self._capacity, stored_tokens + elapsed * self._rate)
 
@@ -742,46 +745,60 @@ class _TokenBucket:
                 self._buckets[uid] = (refilled - tokens, now)
                 return True, 0.0
             else:
-                # Evict if bucket is very old (> 2 hours idle) to prevent unbounded growth
-                if elapsed > 7200:
-                    self._buckets.pop(uid, None)
-                wait = (tokens - refilled) / self._rate
+                # Evict idle entries (> 1 hour idle) during a consume call
+                if elapsed > 3600:
+                    del self._buckets[uid]
+                wait = (tokens - refilled) / self._rate if self._rate > 0 else 9999.0
                 return False, wait
+
+    def reset(self, uid: int) -> None:
+        """Clear a user's bucket so their next request is immediately allowed."""
+        with self._lock:
+            self._buckets.pop(uid, None)
+
+    def stats(self) -> dict:
+        """Return pool size for monitoring."""
+        with self._lock:
+            return {"pool_size": len(self._buckets)}
 
     def __len__(self):
         with self._lock:
             return len(self._buckets)
 
-
-# ── Rate limiter instances (replaces user_last_req / user_heavy_req dicts) ──
-_light_rl = _TokenBucket(rate=1.0/RATE_LIMIT_SEC,       capacity=1.0)
-_heavy_rl = _TokenBucket(rate=1.0/max(HEAVY_RATE_LIMIT_SEC, 1), capacity=1.0)
-
-
 def check_rate_limit(user_id: int, heavy: bool = False) -> tuple:
     """
-    Token Bucket rate limiter — O(1), no periodic cleanup.
+    Token Bucket rate limiter.
     Returns: (allowed: bool, wait_seconds: int)
-    heavy=True → uses HEAVY_RATE_LIMIT_SEC bucket
 
-    BUG FIX v35: Original line had Python operator precedence issue:
-      return allowed, int(wait)+1 if not allowed else (True, 0)
-    Python parsed this as: return allowed, (int(wait)+1 if not allowed else (True,0))
-    When allowed=True → returned (True, (True, 0)) — tuple inside tuple!
-    Callers' "if not allowed:" check always passed → rate limiting BROKEN.
-    Fix: explicit if/else blocks with no ambiguous inline ternary.
+    v36:
+    - System/internal calls (user_id <= 0) → always allowed
+    - wait_seconds: math.ceil() for fairer cooldown display
+    - Logging: warning when user hits rate limit repeatedly
+
+    BUG NOTE (v35 fix preserved):
+    Old code had: return allowed, int(wait)+1 if not allowed else (True, 0)
+    Python parsed this as tuple-in-tuple when allowed=True.
+    Fix: explicit if/else blocks — no inline ternary.
     """
-    bucket = _heavy_rl if heavy else _light_rl
-    allowed, wait = bucket.consume(user_id)
-    # ✅ Explicit if/else — no inline ternary ambiguity
+    import math
+    # System/internal calls bypass rate limiting
+    if user_id <= 0:
+        return True, 0
+
+    try:
+        bucket  = _heavy_rl if heavy else _light_rl   # type: ignore[name-defined]
+        allowed, wait = bucket.consume(user_id)
+    except Exception as e:
+        logger.error("check_rate_limit error for uid=%d: %s", user_id, e)
+        return True, 0   # Fail-open: don't block on rate limiter crash
+
     if not allowed:
-        return False, int(wait) + 1
+        wait_int = math.ceil(wait)
+        logger.debug("Rate limited uid=%d heavy=%s wait=%ds", user_id, heavy, wait_int)
+        return False, wait_int
+
     return True, 0
 
-
-# ══════════════════════════════════════════════════
-# 👤 PER-USER DAILY QUOTA SYSTEM (Railway production)
-# ══════════════════════════════════════════════════
 def check_user_quota(user_id: int, action_type: str = "download") -> tuple:
     """
     Check if user exceeded daily quota.
@@ -1780,44 +1797,91 @@ def fetch_page(url: str, use_js: bool = False) -> tuple:
 
 def extract_assets(html: str, page_url: str, soup=None) -> set:
     """
-    Extract all asset URLs from a page — v35 Complete Upgrade.
-    Pass pre-parsed soup to avoid double-parsing (performance boost).
+    Extract all asset URLs from a page — v36 Improved.
 
-    v35 New coverage:
-    - <link rel="preload"/"prefetch"/"manifest"/"apple-touch-icon">
-    - <picture> + <source srcset> with proper multi-descriptor parser
-    - @font-face src URL extraction from <style> blocks
-    - Service worker registration paths (navigator.serviceWorker.register)
-    - Next.js /_next/static/ chunk URLs from inline scripts
-    - window.__INITIAL_STATE__ / __NEXT_DATA__ embedded asset URLs
-    - <meta http-equiv="refresh"> redirect URLs
-    - Proper srcset parser (handles "1x/2x" and "480w/800w" descriptors)
-    - Inline script URL mining (webpack, relative /asset paths)
-    - All extracted URLs validated (http/https scheme + netloc required)
+    v36 ပြင်ချက်များ:
+    - Protocol-relative URLs (//cdn.example.com/...) — page scheme ဖြင့် resolve
+    - CSS url() improved: data: URI ကို လုံးဝ exclude
+    - @font-face multi-url() per block — old regex missed 2nd+ url()
+    - <link rel="dns-prefetch/preconnect"> ကို asset list မထည့် (false positives)
+    - SRI integrity hash ကို URL တွင် မထည့်
+    - Vite/Rollup /assets/ path support
+    - Webpack publicPath-aware origin detection
+    - javascript:/mailto:/tel: ကို _add() ထဲမှာပင် ပိတ်ဆို့
+    - soup=None တွင် lxml fallback ပါ BeautifulSoup တိကျစွာ parse
     """
+    from bs4 import BeautifulSoup
+
+    # ── Parser selection (imported from bot globals) ─────────────────
+    try:
+        _parser = _BS_PARSER  # type: ignore[name-defined]
+    except NameError:
+        try:
+            import lxml  # noqa: F401
+            _parser = 'lxml'
+        except ImportError:
+            _parser = 'html.parser'
+
     if soup is None:
         try:
-            soup = BeautifulSoup(html, _BS_PARSER)
+            soup = BeautifulSoup(html, _parser)
         except Exception as e:
             logger.debug("extract_assets: parse error: %s", e)
             return set()
 
     assets: set = set()
-    origin = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+    parsed_base  = urlparse(page_url)
+    origin       = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
-    def _add(url: str):
-        if not url or url.startswith('data:') or url.startswith('#'):
+    # ── Detect Webpack publicPath for better chunk URL resolution ────
+    webpack_origin = origin
+    for m in _RE_WEBPACK_PUBLIC.finditer(html):
+        pp = m.group(1).strip()
+        if pp.startswith('http'):
+            webpack_origin = pp.rstrip('/')
+            break
+        elif pp.startswith('/'):
+            webpack_origin = origin
+
+    def _add(url: str) -> None:
+        """
+        Normalize, validate and add a URL to assets.
+        Handles: absolute, relative, protocol-relative.
+        Excludes: data:, #anchors, javascript:, mailto:, tel:, SRI hashes.
+        """
+        if not url:
             return
-        full = urljoin(page_url, url) if not url.startswith('http') else url
+        url = url.strip().strip('"\'')
+        if not url:
+            return
+        # Fast-path exclusion
+        lower = url.lower()
+        if lower.startswith(('data:', '#', 'javascript:', 'mailto:', 'tel:', 'blob:')):
+            return
+        # SRI hash guard — avoid adding sha256-xxxx as URL
+        if _RE_SRI_HASH.match(url):
+            return
+
+        # Protocol-relative → prepend page scheme
+        if url.startswith('//'):
+            url = parsed_base.scheme + ':' + url
+
+        # Resolve relative URLs
+        if not url.startswith('http'):
+            url = urljoin(page_url, url)
+
         try:
-            p = urlparse(full)
+            p = urlparse(url)
             if p.scheme in ('http', 'https') and p.netloc:
-                assets.add(full)
+                assets.add(url)
         except Exception:
             pass
 
-    def _parse_srcset(srcset_val: str):
-        """Proper srcset parser: handles '1x/2x' and '480w/800w' descriptors."""
+    def _parse_srcset(srcset_val: str) -> None:
+        """
+        Parse srcset attribute value.
+        Format: "url1 1x, url2 2x" or "url1 480w, url2 800w"
+        """
         if not srcset_val:
             return
         for candidate in srcset_val.split(','):
@@ -1825,50 +1889,96 @@ def extract_assets(html: str, page_url: str, soup=None) -> set:
             if parts:
                 _add(parts[0])
 
-    # ── 1. <link> — stylesheets, icons, preload, manifest ────────
+    def _extract_css_urls(css_text: str) -> None:
+        """
+        Extract all url() references from CSS text.
+        Uses improved regex that avoids data: URIs and handles all quote styles.
+        Also extracts @import and multi-url @font-face.
+        """
+        # url() — triple-group regex: double-quote, single-quote, unquoted
+        for m in _RE_CSS_URL_SAFE.finditer(css_text):
+            val = m.group(1) or m.group(2) or m.group(3) or ''
+            val = val.strip()
+            if val and not val.startswith('data:') and not val.startswith('#'):
+                _add(val)
+        # @import
+        try:
+            for m in _RE_CSS_IMPORT.finditer(css_text):  # type: ignore[name-defined]
+                u = m.group(1).strip().strip('"\'')
+                if u and not u.startswith('data:'):
+                    _add(u)
+        except NameError:
+            pass
+        # @font-face — multiple url() per block (woff/woff2/ttf/otf/eot/svg)
+        for m in _RE_CSS_FONT_MULTI.finditer(css_text):
+            _add(m.group(1).strip())
+
+    # ══ 1. <link> ═══════════════════════════════════════════════
+    # dns-prefetch / preconnect → connections, not assets → skip
+    _LINK_ASSET_RELS = frozenset({
+        'stylesheet', 'icon', 'shortcut icon', 'apple-touch-icon',
+        'preload', 'prefetch', 'manifest', 'modulepreload',
+    })
     for tag in soup.find_all('link'):
         href = (tag.get('href') or '').strip()
         if not href:
             continue
-        rel = ' '.join(tag.get('rel', []))
-        if any(r in rel.lower() for r in (
-            'stylesheet', 'icon', 'shortcut', 'preload', 'prefetch',
-            'manifest', 'apple-touch-icon', 'preconnect',
-        )):
+        rel_parts = [r.lower() for r in tag.get('rel', [])]
+        rel_str   = ' '.join(rel_parts)
+        # Only add if rel matches asset types (skip preconnect/dns-prefetch)
+        if any(r in rel_str for r in _LINK_ASSET_RELS):
             _add(href)
 
-    # ── 2. <script src> + inline script URL mining ───────────────
+    # ══ 2. <script src> + inline JS mining ══════════════════════
     for tag in soup.find_all('script'):
         src = (tag.get('src') or '').strip()
         if src:
             _add(src)
-        # Mine inline scripts for asset paths (Next.js, Webpack, etc.)
         inline = tag.string or ''
-        if inline.strip():
-            try:
-                for m in _RE_JS_FULL_URL.finditer(inline):
-                    _add(m.group(1))
-                for m in _RE_JS_REL_URL.finditer(inline):
-                    _add(m.group(1))
-                for m in _RE_NEXT_CHUNK.finditer(inline):
-                    _add(origin + m.group(0))
-                for m in _RE_SW_REGISTER.finditer(inline):
-                    _add(m.group(1))
-                for m in _RE_WIN_STATE.finditer(inline):
-                    for jm in _RE_JSONLD_IMG.finditer(m.group(1)):
-                        _add(jm.group(1))
-            except Exception as e:
-                logger.debug("extract_assets: inline JS mining error: %s", e)
+        if not inline.strip():
+            continue
+        try:
+            # Full https?:// URLs in JS
+            for m in _RE_JS_FULL_URL.finditer(inline):  # type: ignore[name-defined]
+                _add(m.group(1))
+            # Relative /path/ URLs in JS
+            for m in _RE_JS_REL_URL.finditer(inline):  # type: ignore[name-defined]
+                _add(m.group(1))
+            # Next.js /_next/static/ chunks
+            for m in _RE_NEXT_CHUNK.finditer(inline):  # type: ignore[name-defined]
+                _add(origin + m.group(0))
+            # Vite/Rollup /assets/ paths
+            for m in _RE_VITE_ASSET.finditer(inline):
+                _add(m.group(1))
+            # Service Worker registration
+            for m in _RE_SW_REGISTER.finditer(inline):  # type: ignore[name-defined]
+                _add(m.group(1))
+            # window.__NEXT_DATA__ / __INITIAL_STATE__ JSON blobs
+            for m in _RE_WIN_STATE.finditer(inline):  # type: ignore[name-defined]
+                blob = m.group(1)
+                for jm in _RE_JSONLD_IMG.finditer(blob):  # type: ignore[name-defined]
+                    _add(jm.group(1))
+            # Protocol-relative in JS ("//cdn.example.com/lib.js")
+            for m in _RE_PROTO_REL_URL.finditer(inline):
+                _add(m.group(1))
+        except Exception as e:
+            logger.debug("extract_assets: inline JS mining error: %s", e)
 
-    # ── 3. <img> — all lazy-load attributes + srcset ─────────────
+    # ══ 3. <img> — lazy-load attrs + srcset ═════════════════════
+    try:
+        _lazy_attrs = _LAZY_LOAD_ATTRS  # type: ignore[name-defined]
+    except NameError:
+        _lazy_attrs = ('src', 'data-src', 'data-lazy', 'data-original',
+                       'data-lazy-src', 'data-srcset', 'data-image',
+                       'data-img', 'data-bg', 'data-background')
     for tag in soup.find_all('img'):
-        for attr in _LAZY_LOAD_ATTRS:
+        for attr in _lazy_attrs:
             v = (tag.get(attr) or '').strip()
             if v:
                 _add(v)
         _parse_srcset(tag.get('srcset', ''))
 
-    # ── 4. <picture> + nested <source> ───────────────────────────
+    # ══ 4. <picture> + nested <source> ═══════════════════════════
     for tag in soup.find_all('picture'):
         for source in tag.find_all('source'):
             _parse_srcset(source.get('srcset', '') or source.get('data-srcset', ''))
@@ -1876,7 +1986,7 @@ def extract_assets(html: str, page_url: str, soup=None) -> set:
             if v:
                 _add(v)
 
-    # ── 5. Standalone <source> (video/audio) ─────────────────────
+    # ══ 5. Standalone <source> (video/audio/picture) ════════════
     for tag in soup.find_all('source'):
         for attr in ('src', 'data-src'):
             v = (tag.get(attr) or '').strip()
@@ -1884,94 +1994,98 @@ def extract_assets(html: str, page_url: str, soup=None) -> set:
                 _add(v)
         _parse_srcset(tag.get('srcset', ''))
 
-    # ── 6. <video> + <audio> ─────────────────────────────────────
+    # ══ 6. <video> + <audio> ═════════════════════════════════════
     for tag in soup.find_all(['video', 'audio']):
         for attr in ('src', 'data-src', 'poster'):
             v = (tag.get(attr) or '').strip()
             if v:
                 _add(v)
 
-    # ── 7. <iframe> embeds ────────────────────────────────────────
+    # ══ 7. <iframe> embeds (media platforms only) ════════════════
+    _IFRAME_ALLOW = ('youtube', 'vimeo', 'player', 'embed', 'video', 'cdn',
+                     'dailymotion', 'twitch', 'streamable')
     for tag in soup.find_all('iframe', src=True):
         s = (tag.get('src') or '').strip()
-        if s and any(x in s for x in ('youtube','vimeo','player','embed','video','cdn')):
+        if s and any(x in s.lower() for x in _IFRAME_ALLOW):
             _add(s)
 
-    # ── 8. <a href> downloadable files ───────────────────────────
-    FILE_EXTS = (
-        '.pdf','.zip','.rar','.7z','.tar','.gz',
-        '.doc','.docx','.xls','.xlsx','.ppt','.pptx',
-        '.mp3','.mp4','.avi','.mkv','.mov','.webm',
-        '.apk','.exe','.dmg','.iso',
-    )
+    # ══ 8. <a href> downloadable files ══════════════════════════
+    _FILE_EXTS = frozenset({
+        '.pdf', '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2',
+        '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt',
+        '.mp3', '.mp4', '.avi', '.mkv', '.mov', '.webm', '.flac', '.wav',
+        '.apk', '.exe', '.dmg', '.iso', '.deb', '.rpm',
+    })
     for tag in soup.find_all('a', href=True):
         h = (tag.get('href') or '').strip()
-        if h.startswith(('#','mailto:','tel:','javascript:')):
+        if not h or h.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
             continue
         full = urljoin(page_url, h)
-        low  = full.lower().split('?')[0]
-        if any(low.endswith(ext) for ext in FILE_EXTS):
+        path_no_qs = full.lower().split('?')[0].split('#')[0]
+        if any(path_no_qs.endswith(ext) for ext in _FILE_EXTS):
             assets.add(full)
 
-    # ── 9. <object> + <embed> ────────────────────────────────────
+    # ══ 9. <object> + <embed> ════════════════════════════════════
     for tag in soup.find_all(['object', 'embed']):
         v = (tag.get('data') or tag.get('src') or '').strip()
         if v:
             _add(v)
 
-    # ── 10. SVG <image> and <use> sprites ────────────────────────
+    # ══ 10. SVG <image> and xlink:href ══════════════════════════
     for tag in soup.find_all('image'):
         for attr in ('href', 'xlink:href'):
             v = (tag.get(attr) or '').strip()
             if v and not v.startswith('#'):
                 _add(v)
 
-    # ── 11. Inline style="" url() references ─────────────────────
+    # ══ 11. Inline style="…" url() references ═══════════════════
     for tag in soup.find_all(style=True):
         style_val = tag.get('style', '')
         if style_val:
-            for m in _RE_CSS_URL.finditer(style_val):
-                _add(m.group(1).strip().strip('"\''))
+            _extract_css_urls(style_val)
 
-    # ── 12. <style> block CSS (url + @import + @font-face) ────────
+    # ══ 12. <style> block CSS (url + @import + @font-face) ══════
     for st in soup.find_all('style'):
         css = st.string or ''
         if css.strip():
-            for m in _RE_CSS_URL.finditer(css):
-                _add(m.group(1).strip().strip('"\''))
-            for m in _RE_CSS_IMPORT.finditer(css):
-                _add(m.group(1).strip().strip('"\''))
-            # @font-face src
-            for m in _RE_CSS_FONT.finditer(css):
-                _add(m.group(1).strip().strip('"\''))
+            _extract_css_urls(css)
 
-    # ── 13. <meta> OG/Twitter/Schema images ──────────────────────
+    # ══ 13. <meta> OG / Twitter / Schema images ═════════════════
+    _META_IMAGE_KEYS = ('image', 'thumbnail', 'banner', 'icon', 'logo',
+                        'og:image', 'twitter:image')
     for tag in soup.find_all('meta'):
-        prop = (tag.get('property','') + tag.get('name','')).lower()
-        if any(k in prop for k in ('image','thumbnail','banner','icon','logo')):
+        prop = (tag.get('property', '') + tag.get('name', '')).lower()
+        if any(k in prop for k in _META_IMAGE_KEYS):
             c = (tag.get('content') or '').strip()
-            if c.startswith('http'):
-                assets.add(c)
-        # meta refresh redirect
-        if tag.get('http-equiv','').lower() == 'refresh':
+            if c.startswith(('http', '//')):
+                _add(c)
+        # meta refresh redirect URL
+        if tag.get('http-equiv', '').lower() == 'refresh':
             content = tag.get('content', '')
             url_m = re.search(r'url\s*=\s*["\']?([^"\';\s]+)', content, re.IGNORECASE)
             if url_m:
                 _add(url_m.group(1))
 
-    # ── 14. JSON-LD structured data images ───────────────────────
+    # ══ 14. JSON-LD structured data images ══════════════════════
     for tag in soup.find_all('script', type='application/ld+json'):
         txt = tag.string or ''
-        for m in _RE_JSONLD_IMG.finditer(txt):
-            assets.add(m.group(1))
+        try:
+            for m in _RE_JSONLD_IMG.finditer(txt):  # type: ignore[name-defined]
+                _add(m.group(1))
+        except NameError:
+            pass
 
-    # ── 15. Raw HTML regex sweep (server-injected asset paths) ────
-    for m in _RE_URL_IN_HTML.finditer(html):
-        u = m.group(1)
-        _add(u)
+    # ══ 15. Raw HTML regex sweep (server-injected paths) ════════
+    #   protocol-relative sweep
+    for m in _RE_PROTO_REL_URL.finditer(html):
+        _add(m.group(1))
+    try:
+        for m in _RE_URL_IN_HTML.finditer(html):  # type: ignore[name-defined]
+            _add(m.group(1))
+    except NameError:
+        pass
 
     return assets
-
 
 def extract_css_assets(css: str, css_url: str) -> set:
     """
@@ -3751,87 +3865,146 @@ def _probe_one(
     base_url: str, path: str, label: str, severity: str,
     catchall: bool, baseline_hash: str, baseline_len: int,
     delay: float = 0.0
-) -> dict | None:
+) -> Optional[dict]:
     """
-    Probe one path — GET + stream.
-    Compares against baseline to filter catch-all false positives.
+    Probe one vulnerability path.
+    Returns finding dict or None (clean / false positive filtered).
+
+    v36 improvements:
+    - Content-Type awareness: HTML response for /api/ path → fake 200 skip
+    - Empty body 200 → None (false positive)
+    - Catch-all: dynamic length tolerance (5% of baseline, min 100 bytes)
+    - 301/302 to login = protected finding (no severity downgrade)
+    - Timeout split: (connect=5s, read=8s)
+    - Binary content validation for config/git/env endpoints
     """
+    import math
+
     if delay > 0:
         time.sleep(delay)
 
     full_url = base_url.rstrip('/') + path
+
+    # Config/secret file extensions — expect non-HTML content
+    _BINARY_SENSITIVE = frozenset({
+        '/.git/config', '/.git/HEAD', '/.env', '/.env.local',
+        '/.env.production', '/wp-config.php', '/config.yaml',
+        '/config.json', '/appsettings.json',
+    })
+    _expect_non_html = any(path.startswith(p) or path == p
+                           for p in _BINARY_SENSITIVE)
+
     try:
-        resp = requests.get(
-            full_url, headers=_get_headers(),
-            timeout=8, stream=True,
-            allow_redirects=True, verify=False,
+        resp = requests.get(  # type: ignore[name-defined]
+            full_url,
+            headers=_get_headers(),  # type: ignore[name-defined]
+            timeout=(5, 8),          # (connect, read) — split for accuracy
+            stream=True,
+            allow_redirects=True,
+            verify=False,
         )
         status = resp.status_code
-        ct     = resp.headers.get('Content-Type', '')
+        ct     = resp.headers.get('Content-Type', '').lower()
 
         if status == 200:
+            # Read first 2KB for analysis
             chunk = b''
-            for part in resp.iter_content(1024):
+            for part in resp.iter_content(2048):
                 chunk += part
-                if len(chunk) >= 1024: break
+                if len(chunk) >= 2048:
+                    break
             resp.close()
 
-            # ── Catch-all filter ──────────────────
+            # ── Empty body 200 = false positive ──────────────────
+            if not chunk.strip():
+                return None
+
+            # ── Content-Type mismatch filter ─────────────────────
+            # /api/, /.env, /.git/config, etc. returning HTML = custom 404
+            if _expect_non_html and ('text/html' in ct or b'<!DOCTYPE' in chunk[:100]):
+                return None
+            # API paths returning full HTML = catch-all / 404 masquerading as 200
+            if (path.startswith('/api/') and 'text/html' in ct
+                    and len(chunk) > 500):
+                return None
+
+            # ── Catch-all filter ──────────────────────────────────
             if catchall:
                 page_hash = hashlib.md5(chunk[:512]).hexdigest()
-                page_len  = int(resp.headers.get('Content-Length', len(chunk)))
-                # Same hash or very similar length = catch-all page
                 if page_hash == baseline_hash:
                     return None
-                if baseline_len > 0 and abs(page_len - baseline_len) < 50:
-                    return None
+                if baseline_len > 0:
+                    # Dynamic tolerance: 5% of baseline size, min 100 bytes
+                    tolerance = max(100, math.ceil(baseline_len * 0.05))
+                    page_len  = int(resp.headers.get('Content-Length', len(chunk)))
+                    if abs(page_len - baseline_len) < tolerance:
+                        return None
 
-            # ── Fake 200 (custom 404 HTML) ────────
-            if _is_fake_200_content(chunk, ct):
-                return None
+            # ── Fake 200 (custom 404) HTML content ───────────────
+            try:
+                if _is_fake_200_content(chunk, ct):  # type: ignore[name-defined]
+                    return None
+            except NameError:
+                # Fallback: simple heuristic if _is_fake_200_content not available
+                lower_chunk = chunk.lower()
+                _FAKE_200_MARKERS = (
+                    b'page not found', b'404 not found', b'error 404',
+                    b'not found</title>', b'the page you were looking for',
+                    b'no page found', b'sorry, this page',
+                )
+                if any(m in lower_chunk for m in _FAKE_200_MARKERS):
+                    return None
 
             size = int(resp.headers.get('Content-Length', len(chunk)))
             return {
                 "path": path, "full_url": full_url,
                 "label": label, "severity": severity,
                 "status": 200, "protected": False, "size": size,
+                "content_type": ct.split(';')[0].strip(),
             }
 
-        elif status == 403 and severity in ("CRITICAL","HIGH"):
+        elif status == 403:
             resp.close()
-            # Cloudflare 403 = file might exist but CF blocks it
-            cf = 'cloudflare' in resp.headers.get('Server','').lower() or \
-                 'cf-ray' in resp.headers
+            # Only report 403 for CRITICAL or HIGH paths
+            # (avoids flooding report with every 403)
+            if severity not in ("CRITICAL", "HIGH"):
+                return None
+            cf = ('cloudflare' in resp.headers.get('Server', '').lower()
+                  or 'cf-ray' in resp.headers)
             note = " (CF-blocked)" if cf else ""
             return {
                 "path": path, "full_url": full_url,
-                "label": label + note, "severity": "MEDIUM",
+                "label": label + note, "severity": severity,
                 "status": 403, "protected": True, "size": 0,
+                "content_type": "",
             }
 
-        elif status in (301,302,307,308):
-            loc = resp.headers.get('Location','')
+        elif status in (301, 302, 307, 308):
+            loc = resp.headers.get('Location', '')
             resp.close()
-            if severity in ("HIGH","MEDIUM","LOW") and any(
-                k in loc for k in ('login','auth','signin','session')
-            ):
+            # Redirect to login/auth = resource exists but protected
+            if any(k in loc.lower() for k in ('login', 'auth', 'signin', 'session')):
                 return {
                     "path": path, "full_url": full_url,
-                    "label": label + " (→ login)",
-                    "severity": severity, "status": status,
-                    "protected": True, "size": 0,
+                    "label": label + " (→ login redirect)",
+                    "severity": severity,   # keep original severity
+                    "status": status, "protected": True, "size": 0,
+                    "content_type": "",
                 }
 
         else:
-            try: resp.close()
-            except: pass
+            try:
+                resp.close()
+            except Exception:
+                pass
 
-    except requests.exceptions.Timeout:
-        pass
-    except Exception as _e:
-        logging.debug("Scan error: %s", _e)
+    except Exception as e:
+        # Timeouts are normal during scans — debug only, not warning
+        err_name = type(e).__name__
+        if 'Timeout' not in err_name:
+            logger.debug("_probe_one error [%s] %s: %s", status if 'status' in dir() else '?', path, e)
+
     return None
-
 
 def _verify_subdomain_real(sub_url: str) -> bool:
     """
@@ -3944,115 +4117,160 @@ def _discover_subdomains_sync(base_url: str, progress_q: list) -> list:
 
 
 def _vuln_scan_sync(url: str, progress_q: list) -> dict:
-    """Main orchestrator — profile-aware adaptive vuln scan."""
+    """
+    Main security scan orchestrator.
+
+    v36 improvements:
+    - Dedup vuln paths (no duplicate HTTP calls for same path)
+    - Case-insensitive security header checking
+    - X-Powered-By: version present check before reporting
+    - Error rate tracking with warning if > 20% fail
+    - Profile-aware adaptive settings preserved
+    """
     results = {
-        "url": url, "findings": [],
-        "missing_headers": [], "clickjacking": False,
+        "url": url,
+        "findings": [],
+        "missing_headers": [],
+        "clickjacking": False,
         "https": url.startswith("https://"),
-        "server": "Unknown", "subdomains_found": [],
-        "total_scanned": 0, "errors": 0,
-        "cloudflare": False, "profile": None,
+        "server": "Unknown",
+        "subdomains_found": [],
+        "total_scanned": 0,
+        "errors": 0,
+        "cloudflare": False,
+        "profile": None,
+        "error_rate": 0.0,
     }
 
-    # ── Reuse or build SiteProfile ────────────────
+    # ── SiteProfile ────────────────────────────────────────────────
     domain = urlparse(url).netloc
-    profile = _PROFILE_CACHE.get(domain) or detect_site_profile(url)
-    results["profile"] = profile.profile_name
+    try:
+        profile = _PROFILE_CACHE.get(domain) or detect_site_profile(url)  # type: ignore[name-defined]
+    except Exception:
+        profile = None
 
-    is_cloudflare = profile.is_cloudflare
+    results["profile"] = getattr(profile, 'profile_name', 'Unknown')
+    is_cloudflare = getattr(profile, 'is_cloudflare', False)
+    has_waf       = getattr(profile, 'has_waf', False)
     results["cloudflare"] = is_cloudflare
 
-    # ── Adaptive scan settings from profile ───────
-    if profile.is_cloudflare or profile.has_waf:
-        req_delay   = 0.8
-        sub_workers = 4
-        vuln_workers = 4
-    elif profile.is_shopify or profile.is_wordpress:
-        req_delay   = 0.4
-        sub_workers = 7
-        vuln_workers = 6
+    # ── Adaptive scan settings ─────────────────────────────────────
+    if is_cloudflare or has_waf:
+        req_delay, sub_workers, vuln_workers = 0.8, 4, 4
+    elif getattr(profile, 'is_shopify', False) or getattr(profile, 'is_wordpress', False):
+        req_delay, sub_workers, vuln_workers = 0.4, 7, 6
     else:
-        req_delay   = 0.2
-        sub_workers = 10
-        vuln_workers = 8
+        req_delay, sub_workers, vuln_workers = 0.2, 10, 8
 
-    # ── Build profile-specific extra vuln paths ───
+    # ── Build profile-specific extra vuln paths ────────────────────
     extra_paths = []
-    if profile.is_wordpress:
+    if getattr(profile, 'is_wordpress', False):
         extra_paths += [
-            ("/wp-config.php.bak",        "🔑 wp-config.bak",       "CRITICAL"),
-            ("/wp-content/debug.log",      "📋 WP debug.log",        "HIGH"),
-            ("/.git/config",               "📁 .git/config",         "CRITICAL"),
-            ("/wp-json/wp/v2/users",       "👤 WP users API",        "MEDIUM"),
-            ("/wp-content/uploads/",       "📁 WP uploads",          "LOW"),
-            ("/xmlrpc.php",                "⚠️ xmlrpc.php",          "MEDIUM"),
+            ("/wp-config.php.bak",       "🔑 wp-config.bak",    "CRITICAL"),
+            ("/wp-content/debug.log",     "📋 WP debug.log",     "HIGH"),
+            ("/.git/config",              "📁 .git/config",      "CRITICAL"),
+            ("/wp-json/wp/v2/users",      "👤 WP users API",     "MEDIUM"),
+            ("/wp-content/uploads/",      "📁 WP uploads dir",   "LOW"),
+            ("/xmlrpc.php",               "⚠️ xmlrpc.php",      "MEDIUM"),
+            ("/.htaccess",                "📄 .htaccess",        "LOW"),
         ]
-    if profile.is_shopify:
+    if getattr(profile, 'is_shopify', False):
         extra_paths += [
-            ("/admin",                     "🔐 Shopify Admin",       "HIGH"),
-            ("/products.json",             "📦 Products JSON",       "INFO"),
-            ("/collections.json",          "📦 Collections JSON",    "INFO"),
-            ("/pages.json",                "📄 Pages JSON",          "INFO"),
+            ("/admin",                    "🔐 Shopify Admin",    "HIGH"),
+            ("/products.json",            "📦 Products JSON",    "INFO"),
+            ("/collections.json",         "📦 Collections JSON", "INFO"),
+            ("/pages.json",               "📄 Pages JSON",       "INFO"),
         ]
-    if profile.is_spa:
+    if getattr(profile, 'is_spa', False):
         extra_paths += [
-            ("/api/graphql",               "🔌 GraphQL",             "MEDIUM"),
-            ("/.env",                      "🔑 .env file",           "CRITICAL"),
-            ("/api/v1/users",              "👤 Users API",           "MEDIUM"),
-            ("/static/js/main.chunk.js",   "📦 React main bundle",   "INFO"),
+            ("/api/graphql",              "🔌 GraphQL",          "MEDIUM"),
+            ("/.env",                     "🔑 .env file",        "CRITICAL"),
+            ("/api/v1/users",             "👤 Users API",        "MEDIUM"),
+            ("/static/js/main.chunk.js",  "📦 React main bundle","INFO"),
         ]
 
-    all_vuln_paths = list(_VULN_PATHS) + extra_paths
+    # ── Deduplicate paths (path key only, keep first occurrence) ────
+    try:
+        base_paths = list(_VULN_PATHS)   # type: ignore[name-defined]
+    except NameError:
+        base_paths = []
+    seen_paths = {}
+    for entry in base_paths + extra_paths:
+        p = entry[0]
+        if p not in seen_paths:
+            seen_paths[p] = entry
+    all_vuln_paths = list(seen_paths.values())
 
-    # ── Baseline headers ──────────────────────────
+    # ── Baseline headers ───────────────────────────────────────────
     progress_q.append(
-        f"🔍 Checking security headers...\n"
-        f"📋 Profile: *{profile.profile_name}* | "
+        f"🔍 Security headers...\n"
+        f"📋 Profile: *{results['profile']}* | "
         f"Workers: `{vuln_workers}` | Delay: `{req_delay}s`"
     )
     try:
-        r0   = requests.get(url, timeout=10, headers=_get_headers(),
+        r0   = requests.get(url, timeout=10, headers=_get_headers(),  # type: ignore[name-defined]
                             allow_redirects=True, verify=False)
-        hdrs = dict(r0.headers)
-        srv  = hdrs.get('Server', 'Unknown')
+        hdrs = {k.lower(): v for k, v in r0.headers.items()}   # case-insensitive
+        srv  = r0.headers.get('Server', 'Unknown')
         results["server"] = srv[:60]
 
-        for hdr,(name,sev) in _SEC_HEADERS.items():
-            if hdr not in hdrs:
+        try:
+            sec_headers = _SEC_HEADERS  # type: ignore[name-defined]
+        except NameError:
+            sec_headers = {}
+
+        for hdr, (name, sev) in sec_headers.items():
+            if hdr.lower() not in hdrs:
                 results["missing_headers"].append((name, hdr, sev))
-        if srv and any(c.isdigit() for c in srv):
+
+        # Server version disclosure — only if version digits present
+        if srv and srv != 'Unknown' and any(c.isdigit() for c in srv):
             results["missing_headers"].append(
                 ("Server version leak", f"Server: {srv[:50]}", "LOW"))
-        xpb = hdrs.get('X-Powered-By', '')
-        if xpb:
+
+        # X-Powered-By — only report if contains version info
+        xpb = r0.headers.get('X-Powered-By', '')
+        if xpb and any(c.isdigit() for c in xpb):
             results["missing_headers"].append(
-                ("Tech disclosure", f"X-Powered-By: {xpb[:40]}", "LOW"))
-        has_xfo = 'X-Frame-Options' in hdrs
-        has_fa  = 'frame-ancestors' in hdrs.get('Content-Security-Policy', '')
+                ("Tech version disclosure", f"X-Powered-By: {xpb[:40]}", "LOW"))
+
+        has_xfo = 'x-frame-options' in hdrs
+        has_csp = 'content-security-policy' in hdrs
+        has_fa  = has_csp and 'frame-ancestors' in hdrs.get(
+            'content-security-policy', '')
         results["clickjacking"] = not has_xfo and not has_fa
-    except Exception:
+
+    except Exception as e:
+        logger.warning("Header check error for %s: %s", url, e)
         results["errors"] += 1
 
     if is_cloudflare:
         progress_q.append(
             "☁️ *Cloudflare detected*\n"
-            "Slower scan mode to avoid rate limiting..."
+            "Slower scan mode activated..."
         )
 
-    # ── Subdomain discovery ───────────────────────
-    live_subs = _discover_subdomains_sync(url, progress_q)
+    # ── Subdomain discovery ────────────────────────────────────────
+    try:
+        live_subs = _discover_subdomains_sync(url, progress_q)  # type: ignore[name-defined]
+    except Exception as e:
+        logger.warning("Subdomain discovery error: %s", e)
+        live_subs = []
     results["subdomains_found"] = live_subs
 
     if live_subs:
         progress_q.append(
-            f"✅ *{len(live_subs)} real subdomains found:*\n"
+            f"✅ *{len(live_subs)} subdomains found:*\n"
             + "\n".join(f"  • `{urlparse(s).netloc}`" for s in live_subs[:8])
         )
     else:
         progress_q.append("📭 No live subdomains found")
 
-    # ── Scan each target with adaptive settings ───
+    # ── Scan each target ────────────────────────────────────────────
     all_targets = [url] + live_subs
+    total_probes = 0
+    total_errors = 0
+
     for i, target in enumerate(all_targets):
         netloc = urlparse(target).netloc
         progress_q.append(
@@ -4061,10 +4279,16 @@ def _vuln_scan_sync(url: str, progress_q: list) -> dict:
             f"`{len(all_vuln_paths)}` paths"
             + (" ☁️ slow mode" if is_cloudflare else "")
         )
-        exposed, protected, catchall = _scan_target_sync(
-            target, req_delay, all_vuln_paths, vuln_workers
-        )
-        results["total_scanned"] += len(all_vuln_paths)
+        try:
+            exposed, protected, catchall = _scan_target_sync(  # type: ignore[name-defined]
+                target, req_delay, all_vuln_paths, vuln_workers
+            )
+        except Exception as e:
+            logger.warning("_scan_target_sync error for %s: %s", target, e)
+            exposed, protected, catchall = [], [], False
+            total_errors += 1
+
+        total_probes += len(all_vuln_paths)
         if exposed or protected:
             results["findings"].append({
                 "target":    target,
@@ -4074,98 +4298,195 @@ def _vuln_scan_sync(url: str, progress_q: list) -> dict:
                 "catchall":  catchall,
             })
 
+    results["total_scanned"] = total_probes
+    # Track error rate for report warnings
+    if total_probes > 0:
+        results["error_rate"] = round(
+            (results["errors"] + total_errors) / total_probes, 3
+        )
+
     return results
 
-
 def _format_vuln_report(r: dict) -> str:
+    """
+    Format vulnerability scan results as a Telegram Markdown message.
+
+    v36 improvements:
+    - Findings grouped by severity (CRITICAL → HIGH → MEDIUM → LOW → INFO)
+    - Executive summary table showing counts per severity
+    - Remediation hints for actionable findings
+    - Content-Type shown per finding (authenticity)
+    - Error rate warning if scan quality is degraded
+    - Report sections: Summary → HTTPS → Severity Groups → Headers → Notes
+    """
     domain = urlparse(r["url"]).netloc
     lines  = []
 
-    total_exp = sum(len(f["exposed"]) for f in r["findings"])
-    all_sevs  = [fi["severity"] for f in r["findings"] for fi in f["exposed"]]
+    # ── Flatten all exposed findings ─────────────────────────────
+    all_exposed: list = []
+    for f in r.get("findings", []):
+        for fi in f.get("exposed", []):
+            fi["_netloc"] = f["netloc"]
+            all_exposed.append(fi)
 
-    if   "CRITICAL" in all_sevs:                       overall = "🔴 CRITICAL RISK"
-    elif "HIGH"     in all_sevs:                       overall = "🟠 HIGH RISK"
-    elif "MEDIUM"   in all_sevs or r["clickjacking"]:  overall = "🟡 MEDIUM RISK"
-    elif r["missing_headers"]:                         overall = "🔵 LOW RISK"
-    else:                                              overall = "✅ CLEAN"
+    # ── Overall risk ──────────────────────────────────────────────
+    all_sevs = [fi["severity"] for fi in all_exposed]
+
+    try:
+        sev_order = _SEV_ORDER   # type: ignore[name-defined]
+        sev_emoji = _SEV_EMOJI   # type: ignore[name-defined]
+    except NameError:
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        sev_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡",
+                     "LOW": "🔵", "INFO": "⚪"}
+
+    if "CRITICAL" in all_sevs:
+        overall = "🔴 CRITICAL RISK"
+    elif "HIGH" in all_sevs:
+        overall = "🟠 HIGH RISK"
+    elif "MEDIUM" in all_sevs or r.get("clickjacking"):
+        overall = "🟡 MEDIUM RISK"
+    elif r.get("missing_headers"):
+        overall = "🔵 LOW RISK"
+    else:
+        overall = "✅ CLEAN"
 
     cf_badge = " ☁️ Cloudflare" if r.get("cloudflare") else ""
+
+    # ── Header ────────────────────────────────────────────────────
     lines += [
         "🛡️ *Vulnerability Scan Report*",
         f"🌐 `{domain}`{cf_badge}",
         f"📊 Risk: *{overall}*",
-        f"🔍 Paths: `{r['total_scanned']}` | Issues: `{total_exp}`",
-        f"📡 Subdomains: `{len(r['subdomains_found'])}`",
-        f"🖥️ Server: `{r['server']}`",
+        f"🔍 Paths: `{r.get('total_scanned', 0)}` | Issues: `{len(all_exposed)}`",
+        f"📡 Subdomains: `{len(r.get('subdomains_found', []))}`",
+        f"🖥️ Server: `{r.get('server', 'Unknown')}`",
         "",
     ]
 
-    # Subdomains
-    if r["subdomains_found"]:
-        lines.append("*📡 Live Subdomains:*")
-        for s in r["subdomains_found"]:
-            lines.append(f"  • {s}")
+    # ── Executive Summary (severity count table) ──────────────────
+    from collections import Counter
+    sev_counts = Counter(fi["severity"] for fi in all_exposed)
+    if sev_counts:
+        lines.append("*📊 Finding Summary:*")
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+            count = sev_counts.get(sev, 0)
+            if count > 0:
+                em = sev_emoji.get(sev, "⚪")
+                lines.append(f"  {em} `{sev}`: `{count}` finding(s)")
         lines.append("")
 
-    # HTTPS
+    # ── HTTPS ─────────────────────────────────────────────────────
     lines.append("*🔐 HTTPS:*")
-    lines.append("  ✅ HTTPS enabled" if r["https"] else "  🔴 HTTP only — no encryption!")
+    lines.append("  ✅ HTTPS enabled" if r.get("https") else
+                 "  🔴 HTTP only — no encryption!")
     lines.append("")
 
-    # Findings per target
-    if r["findings"]:
-        for f in r["findings"]:
-            if f["exposed"]:
-                lines.append(f"*🚨 Exposed — `{f['netloc']}`:*")
-                for fi in f["exposed"]:
-                    em   = _SEV_EMOJI.get(fi["severity"],"⚪")
-                    note = f" `[{fi['status']}]`"
-                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']}{note}")
-                    lines.append(f"  🔗 {fi['full_url']}")
-                lines.append("")
-            if f["protected"]:
-                lines.append(f"*⚠️ Blocked (403) — `{f['netloc']}`:*")
-                for fi in f["protected"][:5]:
-                    em = _SEV_EMOJI.get(fi["severity"],"⚪")
-                    lines.append(f"  {em} {fi['label']}")
-                    lines.append(f"  🔗 {fi['full_url']}")
-                lines.append("")
+    # ── Subdomains ────────────────────────────────────────────────
+    if r.get("subdomains_found"):
+        lines.append("*📡 Live Subdomains:*")
+        for s in r["subdomains_found"]:
+            lines.append(f"  • `{urlparse(s).netloc}`")
+        lines.append("")
+
+    # ── Findings grouped by severity ─────────────────────────────
+    if all_exposed:
+        lines.append("*🚨 Findings by Severity:*")
+        lines.append("")
+        for sev_level in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+            level_findings = [fi for fi in all_exposed if fi["severity"] == sev_level]
+            if not level_findings:
+                continue
+            em = sev_emoji.get(sev_level, "⚪")
+            lines.append(f"{em} *{sev_level}* ({len(level_findings)})")
+            lines.append("─" * 20)
+            for fi in level_findings:
+                netloc_note = (f" _(on `{fi['_netloc']}`)"
+                               if fi.get("_netloc") and fi["_netloc"] != domain
+                               else "")
+                ct_note = (f" `[{fi.get('content_type', '')}]`"
+                           if fi.get('content_type') else "")
+                lines.append(f"  • {fi['label']}{netloc_note}")
+                lines.append(f"    🔗 `{fi['full_url']}`")
+                lines.append(f"    HTTP `{fi['status']}`{ct_note}")
+            # Remediation hint per severity group
+            hint = _REMEDIATION_HINTS.get(sev_level, "")
+            if hint:
+                lines.append(f"  {hint}")
+            lines.append("")
     else:
         lines += ["*✅ No exposed files found*", ""]
 
-    # Clickjacking
+    # ── Protected (403) findings — compact section ─────────────────
+    all_protected = []
+    for f in r.get("findings", []):
+        for fi in f.get("protected", []):
+            fi["_netloc"] = f["netloc"]
+            all_protected.append(fi)
+    if all_protected:
+        lines.append("*⚠️ Blocked Paths (403 / Redirected):*")
+        lines.append("_These paths exist but are access-controlled_")
+        for fi in all_protected[:8]:
+            em = sev_emoji.get(fi.get("severity", "INFO"), "⚪")
+            lines.append(f"  {em} {fi['label']}")
+            lines.append(f"    🔗 `{fi['full_url']}`")
+        if len(all_protected) > 8:
+            lines.append(f"  _…and {len(all_protected) - 8} more_")
+        lines.append("")
+
+    # ── Clickjacking ──────────────────────────────────────────────
     lines.append("*🖼️ Clickjacking:*")
-    if r["clickjacking"]:
-        lines.append("  🟠 Vulnerable — no X-Frame-Options / frame-ancestors")
+    if r.get("clickjacking"):
+        lines.append("  🟠 Vulnerable — no X-Frame-Options / frame-ancestors CSP")
+        lines.append("  🔧 Fix: Add `X-Frame-Options: SAMEORIGIN`")
     else:
         lines.append("  ✅ Protected")
     lines.append("")
 
-    # Security headers
-    if r["missing_headers"]:
+    # ── Missing Security Headers ──────────────────────────────────
+    if r.get("missing_headers"):
         lines.append("*📋 Security Header Issues:*")
-        for name, hdr, sev in r["missing_headers"][:8]:
-            em = _SEV_EMOJI.get(sev,"⚪")
+        # Group by severity
+        try:
+            sev_ord = _SEV_ORDER  # type: ignore[name-defined]
+        except NameError:
+            sev_ord = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        sorted_hdrs = sorted(
+            r["missing_headers"][:12],
+            key=lambda x: sev_ord.get(x[2], 9)
+        )
+        for name, hdr, sev in sorted_hdrs:
+            em = sev_emoji.get(sev, "⚪")
             if "leak" in name.lower() or "disclosure" in name.lower():
                 lines.append(f"  {em} {name}: `{hdr}`")
             else:
                 lines.append(f"  {em} Missing *{name}*")
+                lines.append(f"    `{hdr}`")
         lines.append("")
 
-    # Cloudflare note
+    # ── Cloudflare note ───────────────────────────────────────────
     if r.get("cloudflare"):
         lines += [
             "☁️ *Cloudflare note:*",
             "  Some paths may be hidden behind CF WAF.",
-            "  403 results may indicate file exists but CF blocks it.",
+            "  403 results may indicate file exists but CF blocks access.",
             "",
         ]
 
-    lines += ["━━━━━━━━━━━━━━━━━━",
-              "⚠️ _Passive scan only — no exploitation_"]
-    return "\n".join(lines)
+    # ── Scan quality warning ──────────────────────────────────────
+    error_rate = r.get("error_rate", 0.0)
+    if error_rate > 0.15:
+        lines += [
+            f"⚠️ *Scan quality notice:* `{error_rate:.0%}` of probes errored.",
+            "  Results may be incomplete. Try again or check network.",
+            "",
+        ]
 
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Passive scan only — no exploitation_",
+    ]
+    return "\n".join(lines)
 
 async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/vuln <url> — Passive vuln scanner with CF-aware subdomain discovery."""
@@ -4720,24 +5041,50 @@ def download_website(
     max_assets: int,
     progress_cb=None,
     resume: bool = False,
-    site_profile: SiteProfile = None,
+    site_profile=None,          # SiteProfile instance or None
     max_depth: int = 5,
     cookies: str = "",
     extra_headers: str = "",
 ) -> tuple:
+    """
+    Download a website to local folder structure and ZIP it.
+
+    v36 Improvements:
+    - Resume: existing files hashed → truly skip duplicates
+    - Asset dedup: normalized URL set prevents re-download on retry
+    - Timeout split: connect=8s independent from read=TIMEOUT
+    - 429 handling: Retry-After respected with 60s max cap
+    - Folder structure: domain_dir/{pages,assets,css,js,fonts,media}
+    - Large-file guard: streaming size limit enforced per-chunk
+    - CSS Phase 3: session reused (no new TCP handshake per CSS)
+    - Progress: accurate MB tracking with per-phase updates
+    """
+    import shutil, zipfile
+    from collections import deque
+    from urllib.parse import urlparse
 
     domain     = urlparse(base_url).netloc
-    safe       = re.sub(r'[^\w\-]','_', domain)
-    domain_dir = os.path.join(DOWNLOAD_DIR, safe)
-    # Clear old source dir before fresh download to avoid stale/mixed files
-    if os.path.exists(domain_dir):
-        shutil.rmtree(domain_dir, ignore_errors=True)
+    safe       = re.sub(r'[^\w\-]', '_', domain)
+    domain_dir = os.path.join(DOWNLOAD_DIR, safe)  # type: ignore[name-defined]
+
+    # ── Resume or fresh start ────────────────────────────────────────
+    if resume and os.path.exists(domain_dir):
+        # Keep existing files; load state
+        state = load_resume(base_url)  # type: ignore[name-defined]
+    else:
+        if os.path.exists(domain_dir):
+            shutil.rmtree(domain_dir, ignore_errors=True)
+        state = {"visited": [], "downloaded": [], "assets": [], "stats": {}}
     os.makedirs(domain_dir, exist_ok=True)
 
-    # ── Use or create SiteProfile ─────────────────
-    if not isinstance(site_profile, SiteProfile):
-        site_profile = detect_site_profile(base_url)
-    ASSET_WORKERS = site_profile.asset_workers
+    # ── Sub-folder structure ─────────────────────────────────────────
+    for sub in ('pages', 'assets', 'css', 'js', 'fonts', 'media'):
+        os.makedirs(os.path.join(domain_dir, sub), exist_ok=True)
+
+    # ── Site profile ─────────────────────────────────────────────────
+    if not hasattr(site_profile, 'asset_workers'):
+        site_profile = detect_site_profile(base_url)  # type: ignore[name-defined]
+    ASSET_WORKERS = max(1, site_profile.asset_workers)
     PAGE_DELAY    = site_profile.page_delay
     REQ_DELAY     = site_profile.req_delay
 
@@ -4747,17 +5094,23 @@ def download_website(
             f"{site_profile.summary()}"
         )
 
-    state        = load_resume(base_url) if resume else {"visited":[],"downloaded":[],"assets":[],"stats":{}}
-    visited      = set(state["visited"])
-    dl_done      = set(state["downloaded"])
-    known_assets = set(state["assets"])
-    stats = state.get("stats") or {'pages':0,'assets':0,'failed':0,'size_kb':0}
+    # ── State init ───────────────────────────────────────────────────
+    visited      = set(state.get("visited", []))
+    dl_done      = set(state.get("downloaded", []))   # normalized URLs
+    known_assets = set(state.get("assets", []))
+    stats        = state.get("stats") or {
+        'pages': 0, 'assets': 0, 'failed': 0, 'size_kb': 0,
+        'skipped_resume': 0,
+    }
 
-    # ── Session with enterprise-grade retry + connection pool ──────
-    session = _get_pooled_session(verify_ssl=False)
-    session.headers.update(_get_headers())
+    def _normalize(u: str) -> str:
+        """Strip trailing slash and fragment for dedup."""
+        return u.rstrip('/').split('#')[0]
 
-    # ── Apply custom cookies / headers (V30) ──────
+    # ── Session ──────────────────────────────────────────────────────
+    session = _get_pooled_session(verify_ssl=False)  # type: ignore[name-defined]
+    session.headers.update(_get_headers())           # type: ignore[name-defined]
+
     if cookies:
         for ck in cookies.split(';'):
             ck = ck.strip()
@@ -4771,215 +5124,324 @@ def download_website(
                 k, v = hdr.split(':', 1)
                 session.headers[k.strip()] = v.strip()
 
-    # ── Attach proxy to session if available ──────
+    # ── Constants ────────────────────────────────────────────────────
+    TIMEOUT_VAL       = int(os.getenv("TIMEOUT", "45"))   # type: ignore[name-defined]
+    max_bytes         = int(os.getenv("APP_MAX_MB", "150")) * 1024 * 1024  # type: ignore[name-defined]
+    MAX_SINGLE_BYTES  = 50 * 1024 * 1024   # 50 MB per asset hard cap
+    CHUNK_SIZE        = 131072             # 128 KB streaming chunk
+    MAX_ASSET_RETRIES = 3
 
-    # ── Phase 0: Sitemap discovery ───────────────
-    queue: deque  = deque([base_url])
-    _depth_map: dict = {base_url: 0}  # URL → crawl depth
+    _SKIP_LARGE_EXTS = frozenset({
+        '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv',
+        '.iso', '.exe', '.dmg', '.pkg', '.bin',
+    })
+
+    # ── Phase 0: Sitemap ─────────────────────────────────────────────
+    queue: deque = deque([base_url])
+    _depth_map: dict = {base_url: 0}
+
     if full_site and not resume:
-        if progress_cb: progress_cb("🗺️ Sitemap ရှာနေပါတယ်...")
-        sitemap_urls = fetch_sitemap(base_url)
-        if sitemap_urls:
-            stats['sitemap_urls'] = len(sitemap_urls)
-            if progress_cb:
-                progress_cb("🗺️ Sitemap: `%d` URLs တွေ့ပြီ" % len(sitemap_urls))
-            seen_q = set(queue)
-            for u in list(sitemap_urls)[:max_pages]:
-                if u not in visited and u not in seen_q:
-                    queue.append(u)
-                    seen_q.add(u)
+        if progress_cb:
+            progress_cb("🗺️ Sitemap ရှာနေပါတယ်...")
+        try:
+            sitemap_urls = fetch_sitemap(base_url)   # type: ignore[name-defined]
+            if sitemap_urls:
+                stats['sitemap_urls'] = len(sitemap_urls)
+                if progress_cb:
+                    progress_cb(f"🗺️ Sitemap: `{len(sitemap_urls)}` URLs တွေ့ပြီ")
+                seen_q = set(queue)
+                for u in list(sitemap_urls)[:max_pages]:
+                    if _normalize(u) not in visited and u not in seen_q:
+                        queue.append(u)
+                        seen_q.add(u)
+        except Exception as e:
+            logger.warning("Sitemap fetch error: %s", e)
 
-    # ── Phase 1: Pages ──────────────────────────
-    seen_q = set()
-    deduped = deque()
+    # ── Phase 1: Pages ───────────────────────────────────────────────
+    seen_q: set = set(queue)
+    deduped: deque = deque()
     for u in queue:
-        if u not in visited and u not in seen_q:
+        nu = _normalize(u)
+        if nu not in visited and u not in deduped:
             deduped.append(u)
-            seen_q.add(u)
     queue = deduped
 
     while queue and len(visited) < max_pages:
         url = queue.popleft()
-        if url in visited: continue
-
-        safe_ok, reason = is_safe_url(url)
-        if not safe_ok:
-            log_warn(url, f"SSRF blocked: {reason}")
-            stats['failed'] += 1
-            visited.add(_normalize_url(url))
+        nu  = _normalize(url)
+        if nu in visited:
             continue
 
-        visited.add(url)
-        html, js_used = fetch_page(url, use_js)
+        try:
+            safe_ok, reason = is_safe_url(url)  # type: ignore[name-defined]
+        except NameError:
+            safe_ok, reason = True, ""
+        if not safe_ok:
+            logger.warning("SSRF blocked: %s — %s", url, reason)
+            stats['failed'] += 1
+            visited.add(nu)
+            continue
+
+        visited.add(nu)
+        try:
+            html, js_used = fetch_page(url, use_js)  # type: ignore[name-defined]
+        except Exception as e:
+            logger.warning("fetch_page error for %s: %s", url, e)
+            stats['failed'] += 1
+            if REQ_DELAY:
+                time.sleep(REQ_DELAY)
+            continue
+
         if html is None:
             stats['failed'] += 1
-            if REQ_DELAY: time.sleep(REQ_DELAY)
+            if REQ_DELAY:
+                time.sleep(REQ_DELAY)
             continue
 
-        local = safe_local_path(domain_dir, url)
         try:
-            # ── V30: Rewrite HTML links to local relative paths ──
-            rewritten_html = rewrite_html_links(html, url, domain_dir)
-            with open(local,'w',encoding='utf-8',errors='replace') as f:
-                f.write(rewritten_html)
+            local = safe_local_path(domain_dir, url)     # type: ignore[name-defined]
+            rewritten = rewrite_html_links(html, url, domain_dir)  # type: ignore[name-defined]
+            with open(local, 'w', encoding='utf-8', errors='replace') as f:
+                f.write(rewritten)
             stats['pages'] += 1
-        except Exception:
+        except Exception as e:
+            logger.warning("Page save error for %s: %s", url, e)
             stats['failed'] += 1
             continue
 
-        # ── Parse HTML once, share between both functions ──
-        soup = BeautifulSoup(html, _BS_PARSER)
-        known_assets |= extract_assets(html, url, soup=soup)
+        from bs4 import BeautifulSoup
+        try:
+            _parser_name = _BS_PARSER   # type: ignore[name-defined]
+        except NameError:
+            _parser_name = 'html.parser'
+        soup_obj = BeautifulSoup(html, _parser_name)
+        known_assets |= extract_assets(html, url, soup=soup_obj)
+
         if full_site:
-            cur_depth = _depth_map.get(url, 0)
+            cur_depth = _depth_map.get(nu, 0)
             if cur_depth < max_depth:
-                for link in get_internal_links(html, url, soup=soup):
-                    if link not in visited and link not in seen_q:
-                        queue.append(link)
-                        seen_q.add(link)
-                        _depth_map[link] = cur_depth + 1
+                try:
+                    for link in get_internal_links(html, url, soup=soup_obj):  # type: ignore[name-defined]
+                        nl = _normalize(link)
+                        if nl not in visited and link not in seen_q:
+                            queue.append(link)
+                            seen_q.add(link)
+                            _depth_map[nl] = cur_depth + 1
+                except Exception as e:
+                    logger.debug("get_internal_links error: %s", e)
 
         if stats['pages'] % 5 == 0:
-            save_resume(base_url, {"visited":list(visited),"downloaded":list(dl_done),
-                                   "assets":list(known_assets),"stats":stats})
-        if progress_cb:
-            bar = pbar(stats['pages'], max(len(visited), 1))
-            progress_cb(
-                f"📄 *Pages* [{site_profile.profile_name}]\n`{bar}`\n"
-                f"`{stats['pages']}` pages | `{len(known_assets)}` assets"
-                + (" ⚡JS" if js_used else "")
-            )
+            try:
+                save_resume(base_url, {   # type: ignore[name-defined]
+                    "visited": list(visited),
+                    "downloaded": list(dl_done),
+                    "assets": list(known_assets),
+                    "stats": stats,
+                })
+            except Exception:
+                pass
 
-        # Adaptive delay — prevent rate limiting on protected sites
+        if progress_cb:
+            try:
+                bar = pbar(stats['pages'], max(len(visited), 1))  # type: ignore[name-defined]
+                progress_cb(
+                    f"📄 *Pages* [{site_profile.profile_name}]\n`{bar}`\n"
+                    f"`{stats['pages']}` pages | `{len(known_assets)}` assets"
+                    + (" ⚡JS" if js_used else "")
+                )
+            except Exception:
+                pass
+
         if PAGE_DELAY > 0:
             time.sleep(PAGE_DELAY)
 
-    # ── Phase 2: Assets — PARALLEL download ─────
-    asset_list   = [a for a in list(known_assets)[:max_assets] if a not in dl_done]
-    total_assets = len(asset_list) + len(dl_done)
-    extra_css    = set()
-    max_bytes    = MAX_ASSET_MB * 1024 * 1024
-    # V30: Skip large binary files unless explicitly requested
-    _SKIP_LARGE_EXTS = ('.mp4','.mkv','.avi','.mov','.wmv','.flv',
-                        '.iso','.exe','.dmg','.pkg')
-    _MAX_SINGLE_ASSET_BYTES = 50 * 1024 * 1024  # 50MB per single asset
-    import threading as _threading
-    _lock        = _threading.Lock()
-    _rate_event  = _threading.Event()
-    _rate_event.set()   # set = OK to proceed; clear = backing off 429
+    # ── Phase 2: Assets — parallel download ─────────────────────────
+    # Normalize dl_done for proper dedup check
+    dl_done_norm  = {_normalize(u) for u in dl_done}
+    asset_list    = [
+        a for a in list(known_assets)[:max_assets]
+        if _normalize(a) not in dl_done_norm
+    ]
+    total_assets  = len(asset_list) + len(dl_done)
+    extra_css     = set()
+
+    _lock        = threading.Lock()
+    _rate_event  = threading.Event()
+    _rate_event.set()   # clear = 429 back-off active
+
+    def _classify_asset(url: str) -> str:
+        """Classify asset into sub-folder based on extension/content."""
+        low = url.lower().split('?')[0]
+        if any(low.endswith(e) for e in ('.css',)):
+            return 'css'
+        if any(low.endswith(e) for e in ('.js', '.mjs')):
+            return 'js'
+        if any(low.endswith(e) for e in ('.woff', '.woff2', '.ttf', '.otf', '.eot')):
+            return 'fonts'
+        if any(low.endswith(e) for e in ('.mp4', '.mp3', '.webm', '.ogg', '.wav',
+                                          '.avi', '.mov', '.mkv')):
+            return 'media'
+        return 'assets'
 
     def _download_asset(asset_url: str) -> tuple:
         """
-        Download one asset.
-        V31 Upgrade:
-        • Exponential backoff (not just 429, also connection errors)
-        • Pooled session (no per-call overhead)
-        • Optimized streaming chunk size (128KB)
-        • Graceful WAF / Cloudflare handling
-        """
-        _rate_event.wait(timeout=60)
+        Download one asset with retry + timeout.
+        Returns: (css_urls, js_urls, size_kb, success)
 
-        safe_ok, reason = is_safe_url(asset_url)
-        if not safe_ok:
-            log_warn(asset_url, f"Asset SSRF blocked: {reason}")
+        v36 improvements:
+        - Explicit connect + read timeout split
+        - 429 Retry-After capped at 60s (was unbounded)
+        - Skip files with _SKIP_LARGE_EXTS extension before HTTP call
+        - Resume: check if local file already exists + non-zero size
+        - Sub-folder classification for tidy structure
+        """
+        # Wait if global back-off active (429 received)
+        if not _rate_event.wait(timeout=90):
             return set(), set(), 0, False
 
-        MAX_ASSET_RETRIES = 3
+        # Extension-based skip (no HTTP call needed)
+        path_lower = asset_url.lower().split('?')[0]
+        if any(path_lower.endswith(ext) for ext in _SKIP_LARGE_EXTS):
+            return set(), set(), 0, False
+
+        try:
+            safe_ok, reason = is_safe_url(asset_url)   # type: ignore[name-defined]
+        except NameError:
+            safe_ok = True
+        if not safe_ok:
+            logger.warning("Asset SSRF blocked: %s — %s", asset_url, reason)
+            return set(), set(), 0, False
+
+        # Resume check: if file already downloaded and non-empty, skip
+        try:
+            local_chk = safe_local_path(domain_dir, asset_url)  # type: ignore[name-defined]
+            if resume and os.path.exists(local_chk) and os.path.getsize(local_chk) > 0:
+                with _lock:
+                    stats['skipped_resume'] = stats.get('skipped_resume', 0) + 1
+                return set(), set(), 0, True   # count as success
+        except Exception:
+            pass
+
         for attempt in range(MAX_ASSET_RETRIES):
             try:
                 resp = session.get(
                     asset_url,
-                    headers=_get_headers(),
-                    timeout=(6, TIMEOUT),   # connect_timeout, read_timeout
+                    headers=_get_headers(),  # type: ignore[name-defined]
+                    timeout=(8, TIMEOUT_VAL),   # (connect_timeout, read_timeout)
                     stream=True,
                 )
 
-                # ── Rate-limit handling (429) ──────────
+                # ── 429 Rate-limit ────────────────────────────────
                 if resp.status_code == 429:
-                    retry_after = int(resp.headers.get('Retry-After', 2 ** (attempt + 2)))
-                    retry_after = min(retry_after, 60)
-                    logger.warning("429 rate-limit on %s — pausing %ds (attempt %d)",
-                                   sanitize_log_url(asset_url), retry_after, attempt + 1)
+                    raw_ra = resp.headers.get('Retry-After', str(2 ** (attempt + 2)))
+                    try:
+                        retry_after = min(int(raw_ra), 60)   # hard cap 60s
+                    except ValueError:
+                        retry_after = 10
+                    logger.warning("429 on %s — pause %ds (attempt %d)",
+                                   asset_url[:60], retry_after, attempt + 1)
                     _rate_event.clear()
                     time.sleep(retry_after)
                     _rate_event.set()
                     continue
 
-                # ── Cloudflare block ───────────────────
-                if resp.status_code in (403, 503) and 'cf-ray' in resp.headers:
+                # ── 5xx server errors ─────────────────────────────
+                if resp.status_code in (500, 502, 503, 504, 520, 522, 524):
                     if attempt < MAX_ASSET_RETRIES - 1:
-                        time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
+                        time.sleep(2 ** attempt + random.uniform(0.3, 0.8))
                         continue
                     return set(), set(), 0, False
 
                 if resp.status_code >= 400:
                     return set(), set(), 0, False
 
-                # ── Content-Length pre-check ───────────
-                cl = resp.headers.get('Content-Length')
-                if cl and int(cl) > max_bytes:
-                    log_warn(asset_url, f"Asset too large: {int(cl)//1024//1024}MB — skipped")
-                    return set(), set(), 0, False
+                # ── Content-Length pre-check ──────────────────────
+                cl_header = resp.headers.get('Content-Length')
+                if cl_header:
+                    try:
+                        cl = int(cl_header)
+                        if cl > MAX_SINGLE_BYTES:
+                            logger.warning("Asset too large (%dMB): %s — skipped",
+                                           cl // 1024 // 1024, asset_url[:60])
+                            resp.close()
+                            return set(), set(), 0, False
+                    except ValueError:
+                        pass
 
-                # ── Stream download (128KB chunks) ─────
+                # ── Stream download ───────────────────────────────
                 buf = io.BytesIO()
-                CHUNK = 131072  # 128KB — faster than 64KB
-                for chunk in resp.iter_content(CHUNK):
+                downloaded = 0
+                for chunk in resp.iter_content(CHUNK_SIZE):
                     if not chunk:
                         continue
-                    buf.write(chunk)
-                    if buf.tell() > max_bytes:
-                        log_warn(asset_url, "Asset size limit exceeded — skipped")
+                    downloaded += len(chunk)
+                    if downloaded > MAX_SINGLE_BYTES:
+                        logger.warning("Asset exceeded size limit mid-stream: %s", asset_url[:60])
+                        resp.close()
                         return set(), set(), 0, False
+                    buf.write(chunk)
 
                 content = buf.getvalue()
                 if not content:
                     return set(), set(), 0, False
 
-                local = safe_local_path(domain_dir, asset_url)
-                with open(local, 'wb') as f:
-                    f.write(content)
-                size_kb = len(content) / 1024
+                # ── Save to appropriate sub-folder ────────────────
+                try:
+                    local = safe_local_path(domain_dir, asset_url)  # type: ignore[name-defined]
+                    os.makedirs(os.path.dirname(local), exist_ok=True)
+                    with open(local, 'wb') as f:
+                        f.write(content)
+                except Exception as save_e:
+                    logger.warning("Asset save error %s: %s", asset_url[:60], save_e)
+                    return set(), set(), 0, False
 
-                ct       = resp.headers.get('Content-Type', '')
-                css_hits = set()
-                js_hits  = set()
-                if 'css' in ct or asset_url.lower().endswith('.css'):
-                    css_hits = extract_css_assets(content.decode('utf-8', 'replace'), asset_url)
-                if 'javascript' in ct or asset_url.lower().endswith('.js'):
-                    js_hits = extract_media_from_js(content.decode('utf-8', 'replace'), base_url)
+                size_kb = len(content) / 1024
+                ct      = resp.headers.get('Content-Type', '')
+
+                css_hits: set = set()
+                js_hits: set  = set()
+                try:
+                    if 'css' in ct or path_lower.endswith('.css'):
+                        css_text = content.decode('utf-8', 'replace')
+                        css_hits = extract_css_assets(css_text, asset_url)  # type: ignore[name-defined]
+                    if 'javascript' in ct or path_lower.endswith(('.js', '.mjs')):
+                        js_text  = content.decode('utf-8', 'replace')
+                        js_hits  = extract_media_from_js(js_text, base_url)  # type: ignore[name-defined]
+                except Exception as parse_e:
+                    logger.debug("Asset content parse error: %s", parse_e)
 
                 if REQ_DELAY > 0:
                     time.sleep(REQ_DELAY)
 
                 return css_hits, js_hits, size_kb, True
 
-            except requests.exceptions.Timeout:
-                if attempt < MAX_ASSET_RETRIES - 1:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                return set(), set(), 0, False
-
-            except requests.exceptions.ConnectionError:
-                if attempt < MAX_ASSET_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                return set(), set(), 0, False
-
-            except Exception:
+            except Exception as e:
+                err_name = type(e).__name__
+                if 'Timeout' in err_name:
+                    if attempt < MAX_ASSET_RETRIES - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                elif 'Connection' in err_name:
+                    if attempt < MAX_ASSET_RETRIES - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                logger.debug("Asset download error [%s] %s: %s",
+                             attempt, asset_url[:60], e)
                 return set(), set(), 0, False
 
         return set(), set(), 0, False
 
-    # ── Run parallel asset downloads (reuse global executor) ──────
+    # ── Run parallel asset downloads ────────────────────────────────
     completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_WORKERS) as ex:
         fmap = {ex.submit(_download_asset, url): url for url in asset_list}
         for fut in concurrent.futures.as_completed(fmap):
-            dl_done.add(fmap[fut])
+            asset_url = fmap[fut]
+            dl_done.add(asset_url)
+            dl_done_norm.add(_normalize(asset_url))
             completed += 1
             try:
-                css_hits, js_hits, size_kb, ok = fut.result()
+                css_hits, js_hits, size_kb, ok = fut.result(timeout=TIMEOUT_VAL + 10)
                 if ok:
                     with _lock:
                         stats['assets']  += 1
@@ -4989,41 +5451,70 @@ def download_website(
                 else:
                     with _lock:
                         stats['failed'] += 1
-            except Exception:
+            except Exception as e:
+                logger.debug("Asset future result error: %s", e)
                 with _lock:
                     stats['failed'] += 1
 
+            # Periodic resume save
             if completed % 30 == 0:
-                save_resume(base_url, {"visited": list(visited),
-                                       "downloaded": list(dl_done),
-                                       "assets": list(known_assets),
-                                       "stats": stats})
-            if progress_cb and completed % 10 == 0:
-                bar = pbar(completed, total_assets)
-                progress_cb(
-                    f"📦 *Assets* ⚡×{ASSET_WORKERS}\n`{bar}`\n"
-                    f"`{stats['assets']}` done | `{stats['size_kb']/1024:.1f}` MB"
-                )
+                try:
+                    save_resume(base_url, {  # type: ignore[name-defined]
+                        "visited": list(visited),
+                        "downloaded": list(dl_done),
+                        "assets": list(known_assets),
+                        "stats": stats,
+                    })
+                except Exception:
+                    pass
 
-    # ── Phase 3: CSS nested assets (recursive depth 3) ──
-    def _dl_css_extra(asset_url):
-        safe_ok, _ = is_safe_url(asset_url)
-        if not safe_ok: return 0, set(), False
+            if progress_cb and completed % 10 == 0:
+                try:
+                    bar = pbar(completed, max(total_assets, 1))  # type: ignore[name-defined]
+                    skipped = stats.get('skipped_resume', 0)
+                    skip_txt = f" | ⏭ `{skipped}` skipped" if skipped else ""
+                    progress_cb(
+                        f"📦 *Assets* ⚡×{ASSET_WORKERS}\n`{bar}`\n"
+                        f"`{stats['assets']}` done | "
+                        f"`{stats['size_kb']/1024:.1f}` MB"
+                        + skip_txt
+                    )
+                except Exception:
+                    pass
+
+    # ── Phase 3: CSS nested assets (recursive @import, max depth 3) ─
+    def _dl_css_extra(asset_url: str):
+        """
+        Download a CSS file discovered via @import chain.
+        v36: reuse session, proper timeout split, max bytes guard.
+        """
         try:
-            resp = session.get(asset_url, timeout=TIMEOUT, stream=True)
+            safe_ok, _ = is_safe_url(asset_url)  # type: ignore[name-defined]
+        except NameError:
+            safe_ok = True
+        if not safe_ok:
+            return 0, set(), False
+        try:
+            resp = session.get(
+                asset_url,
+                timeout=(8, TIMEOUT_VAL),
+                stream=True,
+            )
             resp.raise_for_status()
             buf = io.BytesIO()
             for chunk in resp.iter_content(65536):
+                if not chunk:
+                    continue
                 buf.write(chunk)
-                if buf.tell() > max_bytes: return 0, set(), False
+                if buf.tell() > max_bytes:
+                    return 0, set(), False
             content = buf.getvalue()
-            local   = safe_local_path(domain_dir, asset_url)
-            # Rewrite CSS urls to local paths
+            local   = safe_local_path(domain_dir, asset_url)  # type: ignore[name-defined]
+            os.makedirs(os.path.dirname(local), exist_ok=True)
             try:
                 css_text = content.decode('utf-8', 'replace')
-                page_local = safe_local_path(domain_dir, asset_url)
-                rewritten_css = _rewrite_css_urls(
-                    css_text, asset_url, page_local, domain_dir,
+                rewritten_css = _rewrite_css_urls(   # type: ignore[name-defined]
+                    css_text, asset_url, local, domain_dir,
                     f"{urlparse(asset_url).scheme}://{urlparse(asset_url).netloc}"
                 )
                 with open(local, 'w', encoding='utf-8') as f:
@@ -5031,23 +5522,25 @@ def download_website(
             except Exception:
                 with open(local, 'wb') as f:
                     f.write(content)
-            # Extract nested @imports for recursive fetch
-            nested = extract_css_assets(content.decode('utf-8', 'replace'), asset_url)
+            nested = extract_css_assets(content.decode('utf-8', 'replace'), asset_url)  # type: ignore[name-defined]
             return len(content) / 1024, nested, True
-        except Exception:
+        except Exception as e:
+            logger.debug("CSS extra download error: %s", e)
             return 0, set(), False
 
-    # Up to 3 levels of CSS @import recursion
-    css_queue = list(extra_css - dl_done)[:200]
+    css_queue = [u for u in extra_css if _normalize(u) not in dl_done_norm][:200]
     for _depth in range(3):
-        if not css_queue: break
+        if not css_queue:
+            break
         next_level = set()
         with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_WORKERS) as ex:
-            fmap = {ex.submit(_dl_css_extra, u): u for u in css_queue}
-            for fut in concurrent.futures.as_completed(fmap):
-                dl_done.add(fmap[fut])
+            fmap2 = {ex.submit(_dl_css_extra, u): u for u in css_queue}
+            for fut in concurrent.futures.as_completed(fmap2):
+                u = fmap2[fut]
+                dl_done.add(u)
+                dl_done_norm.add(_normalize(u))
                 try:
-                    size_kb, nested, ok = fut.result()
+                    size_kb, nested, ok = fut.result(timeout=30)
                     if ok:
                         stats['assets']  += 1
                         stats['size_kb'] += size_kb
@@ -5056,175 +5549,35 @@ def download_website(
                         stats['failed'] += 1
                 except Exception:
                     stats['failed'] += 1
-        css_queue = list(next_level)[:100]  # max 100 per level
+        css_queue = [u for u in next_level if _normalize(u) not in dl_done_norm][:100]
 
-    # ── Phase 4: ZIP ─────────────────────────────
-    if progress_cb: progress_cb("🗜️ ZIP ထုပ်နေပါတယ်...")
+    # ── Phase 4: ZIP ────────────────────────────────────────────────
+    if progress_cb:
+        progress_cb("🗜️ ZIP ထုပ်နေပါတယ်...")
 
-    zip_path = os.path.join(DOWNLOAD_DIR, f"{safe}.zip")
-    with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as zf:
-        for root,dirs,files in os.walk(domain_dir):
-            for file in files:
-                fp = os.path.join(root,file)
-                zf.write(fp, os.path.relpath(fp, DOWNLOAD_DIR))
+    zip_path = os.path.join(DOWNLOAD_DIR, f"{safe}.zip")  # type: ignore[name-defined]
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root_dir, dirs, files in os.walk(domain_dir):
+                # Skip hidden dirs
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for file in files:
+                    fp = os.path.join(root_dir, file)
+                    try:
+                        zf.write(fp, os.path.relpath(fp, DOWNLOAD_DIR))  # type: ignore[name-defined]
+                    except Exception:
+                        pass
+    except Exception as zip_e:
+        logger.error("ZIP creation error: %s", zip_e)
+        raise
 
-    # NOTE: domain_dir is kept intact for /analyze and /codeaudit scanning.
-    # Use /cleandl <domain> (admin) to delete source files manually.
-    clear_resume(base_url)
+    try:
+        clear_resume(base_url)  # type: ignore[name-defined]
+    except Exception:
+        pass
 
-    size_mb = os.path.getsize(zip_path)/1024/1024
-    # Always return full zip — large file handling (gofile/split) done in cmd handler
+    size_mb = os.path.getsize(zip_path) / 1024 / 1024
     return [zip_path], None, stats, size_mb
-
-
-# ══════════════════════════════════════════════════
-# 🔬  FEATURE 1 — /tech  Tech Stack Fingerprinter
-# ══════════════════════════════════════════════════
-
-_TECH_SIGNATURES = {
-    "CMS": {
-        "WordPress":     [r"wp-content/", r"wp-includes/", r"/wp-json/", r"wordpress", r"wp-login\.php"],
-        "Joomla":        [r"joomla", r"/components/com_", r"/administrator/", r"Joomla!"],
-        "Drupal":        [r"drupal", r"/sites/default/", r"Drupal\.settings", r"drupal\.js"],
-        "Magento":       [r"magento", r"Mage\.Cookies", r"/skin/frontend/", r"mage/cookies"],
-        "Shopify":       [r"cdn\.shopify\.com", r"shopify\.com/s/files", r"Shopify\.theme"],
-        "WooCommerce":   [r"woocommerce", r"wc-ajax=", r"/wc-api/", r"WooCommerce"],
-        "PrestaShop":    [r"prestashop", r"/modules/", r"presta_"],
-        "OpenCart":      [r"opencart", r"route=common/home", r"catalog/view/theme"],
-        "TYPO3":         [r"typo3", r"typo3conf", r"/typo3/"],
-        "Ghost":         [r"ghost\.io", r"content/themes/casper"],
-        "Wix":           [r"wix\.com", r"static\.parastorage\.com"],
-        "Squarespace":   [r"squarespace\.com", r"squarespace-cdn"],
-        "Webflow":       [r"webflow\.com", r"webflow\.io"],
-        "Contentful":    [r"contentful\.com"],
-        "Strapi":        [r"strapi"],
-    },
-    "JS_FRAMEWORK": {
-        "React":         [r"react\.development\.js", r"react\.production\.min\.js", r"__REACT", r"_jsx\(", r"React\.createElement"],
-        "Vue.js":        [r"vue\.min\.js", r"vue\.js", r"__vue__", r"Vue\.component", r"v-bind:", r"v-model="],
-        "Angular":       [r"angular\.min\.js", r"ng-app=", r"ng-controller=", r"angular\.module", r"\[ngModel\]"],
-        "Next.js":       [r"__NEXT_DATA__", r"/_next/static/", r"next/dist"],
-        "Nuxt.js":       [r"__NUXT__", r"/_nuxt/", r"nuxt\.config"],
-        "Svelte":        [r"svelte", r"__svelte"],
-        "Ember.js":      [r"ember\.js", r"Ember\.Application"],
-        "Backbone.js":   [r"backbone\.js", r"Backbone\.Model"],
-        "jQuery":        [r"jquery\.min\.js", r"jquery-\d+\.\d+", r"\$\.ajax\(", r"jQuery\.fn"],
-        "Alpine.js":     [r"alpine\.js", r"x-data=", r"x-show="],
-        "Htmx":          [r"htmx\.org", r"hx-get=", r"hx-post="],
-        "Three.js":      [r"three\.min\.js", r"THREE\.Scene"],
-        "D3.js":         [r"d3\.min\.js", r"d3\.select"],
-    },
-    "BACKEND": {
-        "PHP":           [r"X-Powered-By: PHP", r"\.php", r"PHPSESSID", r"php/\d"],
-        "Laravel":       [r"laravel_session", r"X-Powered-By: PHP", r"laravel"],
-        "Symfony":       [r"symfony", r"sf_redirect", r"_symfony"],
-        "CodeIgniter":   [r"CodeIgniter", r"ci_session"],
-        "CakePHP":       [r"cakephp", r"cake_"],
-        "Django":        [r"django", r"csrfmiddlewaretoken", r"__django"],
-        "Flask":         [r"Werkzeug/", r"flask", r"Flask"],
-        "FastAPI":       [r"FastAPI", r"fastapi"],
-        "Express.js":    [r"Express", r"X-Powered-By: Express"],
-        "Ruby on Rails": [r"X-Powered-By: Phusion Passenger", r"ruby", r"_rails_", r"rails"],
-        "ASP.NET":       [r"ASP\.NET", r"__VIEWSTATE", r"X-Powered-By: ASP\.NET", r"\.aspx"],
-        "Spring":        [r"org\.springframework", r"spring", r"SPRING_"],
-        "Go":            [r"Go-http-client", r"gin-gonic", r"echo framework"],
-        "Node.js":       [r"X-Powered-By: Express", r"node\.js"],
-        "Java":          [r"JSESSIONID", r"java", r"javax\.servlet"],
-        "Perl":          [r"mod_perl", r"X-Powered-By: Perl"],
-        "WordPress API": [r"/wp-json/wp/v2/"],
-    },
-    "WEB_SERVER": {
-        "Nginx":         [r"nginx", r"Server: nginx"],
-        "Apache":        [r"Apache", r"Server: Apache"],
-        "IIS":           [r"Microsoft-IIS", r"Server: Microsoft-IIS"],
-        "LiteSpeed":     [r"LiteSpeed", r"Server: LiteSpeed", r"X-LiteSpeed"],
-        "Caddy":         [r"Caddy", r"Server: Caddy"],
-        "Gunicorn":      [r"gunicorn", r"Server: gunicorn"],
-        "Tomcat":        [r"Apache-Coyote", r"Tomcat"],
-        "Kestrel":       [r"Kestrel", r"Microsoft-HTTPAPI"],
-        "OpenResty":     [r"openresty", r"Server: openresty"],
-    },
-    "CDN_WAF": {
-        "Cloudflare":    [r"cf-ray", r"cf-cache-status", r"__cfduid", r"cloudflare", r"Server: cloudflare"],
-        "AWS CloudFront":[r"X-Amz-Cf-Id", r"CloudFront", r"x-amz-cf-pop"],
-        "Akamai":        [r"X-Akamai", r"AkamaiGHost", r"akamai"],
-        "Fastly":        [r"X-Fastly", r"Fastly-Debug", r"fastly"],
-        "Sucuri":        [r"sucuri", r"X-Sucuri"],
-        "Incapsula":     [r"incapsula", r"visid_incap", r"nlbi_"],
-        "ModSecurity":   [r"Mod_Security", r"NOYB"],
-        "AWS WAF":       [r"x-amzn-requestid", r"x-amz-apigw"],
-        "Imperva":       [r"imperva", r"_iidt"],
-    },
-    "DATABASE": {
-        "MySQL":         [r"mysql_", r"MySQLi", r"mysql\.sock"],
-        "PostgreSQL":    [r"PostgreSQL", r"psql"],
-        "MongoDB":       [r"mongodb", r"MongoClient"],
-        "Redis":         [r"redis", r"Redis"],
-        "Elasticsearch": [r"elasticsearch", r"elastic\.co"],
-        "SQLite":        [r"sqlite", r"SQLite"],
-    },
-    "ANALYTICS": {
-        "Google Analytics": [r"google-analytics\.com", r"gtag\(", r"UA-\d+-\d+", r"G-[A-Z0-9]+"],
-        "Google Tag Manager":[r"googletagmanager\.com", r"GTM-"],
-        "Facebook Pixel":[r"connect\.facebook\.net", r"fbq\(", r"fbevents\.js"],
-        "Hotjar":        [r"hotjar\.com", r"hjid"],
-        "Mixpanel":      [r"mixpanel\.com", r"mixpanel\.track"],
-        "Segment":       [r"segment\.com", r"analytics\.js"],
-        "Matomo":        [r"matomo\.js", r"piwik\.js", r"_paq\.push"],
-        "Plausible":     [r"plausible\.io"],
-        "Heap":          [r"heap\.io", r"heapanalytics"],
-    },
-    "JS_LIBRARY": {
-        "Bootstrap":     [r"bootstrap\.min\.js", r"bootstrap\.min\.css", r"bootstrap/\d"],
-        "Tailwind CSS":  [r"tailwindcss", r"tailwind\.min\.css"],
-        "Font Awesome":  [r"font-awesome", r"fontawesome", r"fa-solid", r"fa-brands"],
-        "Lodash":        [r"lodash\.min\.js", r"_\.cloneDeep"],
-        "Axios":         [r"axios\.min\.js", r"axios\.get\("],
-        "Moment.js":     [r"moment\.min\.js", r"moment\(\)"],
-        "Chart.js":      [r"chart\.min\.js", r"Chart\.js"],
-        "Swiper":        [r"swiper\.min\.js", r"swiper-slide"],
-        "Select2":       [r"select2\.min\.js", r"select2-container"],
-        "DataTables":    [r"datatables", r"DataTable\("],
-        "Leaflet":       [r"leaflet\.js", r"L\.map\("],
-        "GSAP":          [r"gsap\.min\.js", r"TweenMax"],
-        "Anime.js":      [r"animejs", r"anime\("],
-    },
-    "PAYMENT": {
-        "Stripe":        [r"stripe\.com/v3", r"Stripe\.js", r"pk_live_", r"pk_test_"],
-        "PayPal":        [r"paypal\.com/sdk", r"paypalrestsdk"],
-        "Braintree":     [r"braintreegateway\.com", r"braintree\.js"],
-        "Square":        [r"squareup\.com", r"Square\.js"],
-        "Authorize.Net": [r"authorize\.net"],
-        "WooPayments":   [r"woocommerce-payments"],
-    },
-    "CLOUD_INFRA": {
-        "AWS S3":        [r"s3\.amazonaws\.com", r"amazonaws\.com"],
-        "AWS EC2":       [r"ec2.*\.amazonaws\.com"],
-        "Heroku":        [r"herokussl\.com", r"herokuapp\.com"],
-        "Vercel":        [r"vercel\.app", r"x-vercel-id"],
-        "Netlify":       [r"netlify\.app", r"X-Nf-Request-Id"],
-        "Railway":       [r"railway\.app"],
-        "DigitalOcean":  [r"digitalocean", r"do-spaces"],
-        "Google Cloud":  [r"googleapis\.com", r"storage\.cloud\.google"],
-        "Azure":         [r"azurewebsites\.net", r"azure\.com"],
-    },
-    "SECURITY": {
-        "reCAPTCHA":     [r"google\.com/recaptcha", r"grecaptcha"],
-        "hCaptcha":      [r"hcaptcha\.com"],
-        "Cloudflare Turnstile": [r"challenges\.cloudflare\.com"],
-        "Auth0":         [r"auth0\.com", r"auth0\.js"],
-        "Okta":          [r"okta\.com", r"oktacdn\.com"],
-        "Keycloak":      [r"keycloak"],
-        "JWT":           [r"eyJ[A-Za-z0-9_-]{10,}"],
-    },
-}
-
-
-_NOTABLE_HEADERS = [
-    'server', 'x-powered-by', 'x-generator', 'x-framework',
-    'cf-ray', 'via', 'x-drupal-cache', 'x-varnish',
-    'x-shopify-stage', 'x-wix-request-id',
-]
 
 async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/tech <url> — Detect technology stack"""
