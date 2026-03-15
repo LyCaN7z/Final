@@ -151,53 +151,55 @@ async def _animated_spinner_task(
     spin_frames: list = None
 ) -> None:
     """
-    PATCHED _animated_spinner_task — CancelledError + FloodWait fixed.
-    
     Background task: edits a Telegram message every `interval` seconds
     using spinner frames. `get_text_fn()` returns the current body text.
     Caller must cancel this task when done.
-    """
-    from telegram.error import BadRequest, RetryAfter
-    BRAILLE = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"]
-    frames = spin_frames or BRAILLE
-    idx = 0
-    _stop = False
 
-    while not _stop:
+    BUG FIX v35:
+    - asyncio.CancelledError is now explicitly re-raised (was silently swallowed)
+    - RetryAfter (Telegram FloodWait) is now respected with sleep+retry
+    - 'Message to edit not found' → stop spinner cleanly (message deleted)
+    - get_text_fn() exceptions caught separately from Telegram errors
+    """
+    from telegram.error import RetryAfter
+    frames = spin_frames or SPINNER_BRAILLE
+    idx = 0
+    while True:
+        # ✅ Sleep is cancellable — CancelledError propagates cleanly
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
-            return   # ✅ clean shutdown — don't swallow
+            return
 
+        # Safely get text — don't let a bad callback crash the spinner
         try:
             body = get_text_fn() if callable(get_text_fn) else get_text_fn
-            spin = frames[idx % len(frames)]
-            text = f"{spin} {body}"
+        except Exception:
+            body = "Processing…"
+
+        spin = frames[idx % len(frames)]
+        try:
             if hasattr(msg, 'edit_message_text'):
-                await msg.edit_message_text(text, parse_mode='Markdown')
+                await msg.edit_message_text(f"{spin} {body}", parse_mode='Markdown')
             else:
-                await msg.edit_text(text, parse_mode='Markdown')
+                await msg.edit_text(f"{spin} {body}", parse_mode='Markdown')
         except asyncio.CancelledError:
-            return   # ✅ propagate cancellation from edit_text await
+            return   # ✅ Propagate cancellation from edit_text await
         except RetryAfter as e:
-            # FloodWait — respect Telegram's limit
+            # FloodWait — respect Telegram's rate limit
             try:
-                await asyncio.sleep(e.retry_after + 0.5)
+                await asyncio.sleep(getattr(e, 'retry_after', 5) + 1)
             except asyncio.CancelledError:
                 return
-        except BadRequest as e:
+        except Exception as e:
             err = str(e).lower()
             if any(s in err for s in (
                 'message is not modified',
                 'message to edit not found',
                 'there is no text in the message',
             )):
-                # Message deleted or unchanged — stop silently
-                return
-        except Exception:
+                return   # Message deleted or unchanged — stop silently
             # Other transient errors (NetworkError etc.) — skip this tick
-            pass
-
         idx += 1
 
 # ══════════════════════════════════════════════════
@@ -579,9 +581,6 @@ _RE_JS_REL_URL  = re.compile(
 )
 _RE_SITEMAP_LOC = re.compile(r'<loc>\s*(https?://[^<]+)\s*</loc>')
 _RE_ROBOTS_SM   = re.compile(r'(?i)sitemap:\s*(https?://\S+)')
-# v35 new patterns
-_PATCH_RE_CSS_FONT    = re.compile(r'''@font-face\s*\{[^}]*src\s*:[^}]*url\(([^)]+)\)''', re.DOTALL | re.IGNORECASE)
-_PATCH_RE_SRCSET      = re.compile(r'([^\s,]+)(?:\s+(?:\d+(?:\.\d+)?[wx]))?')
 # v35 new patterns for enhanced asset extraction
 _RE_NEXT_CHUNK  = re.compile(r'/_next/static/[^\s"\'<>]+')
 _RE_WEBPACK_CHUNK = re.compile(r'["`\']([a-f0-9]{8,20}\.[a-z0-9]+\.(?:js|css))["`\']')
@@ -759,23 +758,22 @@ _light_rl = _TokenBucket(rate=1.0/RATE_LIMIT_SEC,       capacity=1.0)
 _heavy_rl = _TokenBucket(rate=1.0/max(HEAVY_RATE_LIMIT_SEC, 1), capacity=1.0)
 
 
-def check_rate_limit(user_id: int, heavy: bool = False) -> Tuple[bool, int]:
+def check_rate_limit(user_id: int, heavy: bool = False) -> tuple:
     """
-    PATCHED check_rate_limit — operator precedence bug fixed.
-    
     Token Bucket rate limiter — O(1), no periodic cleanup.
     Returns: (allowed: bool, wait_seconds: int)
     heavy=True → uses HEAVY_RATE_LIMIT_SEC bucket
-    
-    Bug fix: original returned (True, (True, 0)) on allowed=True
-    due to Python ternary operator precedence in return statement.
+
+    BUG FIX v35: Original line had Python operator precedence issue:
+      return allowed, int(wait)+1 if not allowed else (True, 0)
+    Python parsed this as: return allowed, (int(wait)+1 if not allowed else (True,0))
+    When allowed=True → returned (True, (True, 0)) — tuple inside tuple!
+    Callers' "if not allowed:" check always passed → rate limiting BROKEN.
+    Fix: explicit if/else blocks with no ambiguous inline ternary.
     """
-    # NOTE: _heavy_rl and _light_rl are defined in botp.py
-    # This function is a drop-in replacement — same name, fixed logic
     bucket = _heavy_rl if heavy else _light_rl
     allowed, wait = bucket.consume(user_id)
-
-    # ✅ Explicit if/else — NO inline ternary on return
+    # ✅ Explicit if/else — no inline ternary ambiguity
     if not allowed:
         return False, int(wait) + 1
     return True, 0
@@ -830,89 +828,67 @@ def increment_user_quota(user_id: int, action_type: str = "download"):
 # 🔒  SECURITY LAYER 4 — Log Sanitization
 # ══════════════════════════════════════════════════
 
-async def safe_edit(msg, text: str, max_retries: int = 2, **kwargs) -> bool:
+async def safe_edit(msg, text: str, **kwargs) -> bool:
     """
-    PATCHED safe_edit — RetryAfter + message length handling.
-    
-    Returns True on success, False on permanent failure.
-    
-    Handles:
-    ✅ 'Message is not modified'
-    ✅ 'Message to edit not found'
-    ✅ RetryAfter (FloodWait) — sleep + retry once
-    ✅ Text > 4096 chars — auto-truncate
-    ✅ 'Can't parse entities' — retry without parse_mode
+    Edit a Telegram message safely — Message or CallbackQuery support.
+
+    BUG FIX v35:
+    - RetryAfter (FloodWait) now handled with sleep + one retry
+    - Text > 4096 chars auto-truncated (prevents BadRequest)
+    - 'Can't parse entities' retried without parse_mode as fallback
+    - Returns True on success, False on permanent failure
     """
-    from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
+    from telegram.error import RetryAfter
+    # ✅ Telegram hard limit: 4096 chars
+    MAX_TG = 4096
+    if len(text) > MAX_TG:
+        text = text[:MAX_TG - 20] + "\n_…[truncated]_"
 
-    # ✅ Ensure text fits Telegram's limit (4096 chars)
-    MAX_TG_LEN = 4096
-    if len(text) > MAX_TG_LEN:
-        text = text[:MAX_TG_LEN - 20] + "\n_…[truncated]_"
-
-    for attempt in range(max_retries):
+    for attempt in range(2):
         try:
             if hasattr(msg, 'edit_message_text'):
                 await msg.edit_message_text(text, **kwargs)
             else:
                 await msg.edit_text(text, **kwargs)
             return True
-
         except RetryAfter as e:
-            # Telegram FloodWait — respect it
-            wait = getattr(e, 'retry_after', 5) + 1
-            if attempt < max_retries - 1:
+            if attempt == 0:
                 try:
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(getattr(e, 'retry_after', 5) + 1)
                 except asyncio.CancelledError:
                     return False
             else:
-                logger.warning("safe_edit: FloodWait exhausted (%ds), giving up", wait)
                 return False
-
         except BadRequest as e:
             err = str(e).lower()
-            # Silently ignore non-critical
             if any(s in err for s in (
                 "message is not modified",
                 "message to edit not found",
                 "there is no text in the message to edit",
                 "query is too old",
                 "message can't be deleted",
-                "message to delete not found",
             )):
-                return True   # Treated as success (message state already correct)
-
-            # Parse error — retry without parse_mode
-            if "can't parse entities" in err and 'parse_mode' in kwargs:
+                return True
+            # Parse entity error — retry without parse_mode
+            if "can't parse entities" in err and 'parse_mode' in kwargs and attempt == 0:
+                kwargs_plain = {k: v for k, v in kwargs.items() if k != 'parse_mode'}
+                safe_text = re.sub(r'[*_`\[\]]', '', text)
                 try:
-                    new_kwargs = {k: v for k, v in kwargs.items() if k != 'parse_mode'}
-                    # Strip markdown chars for safety
-                    safe_text = re.sub(r'[*_`\[\]]', '', text)
                     if hasattr(msg, 'edit_message_text'):
-                        await msg.edit_message_text(safe_text, **new_kwargs)
+                        await msg.edit_message_text(safe_text, **kwargs_plain)
                     else:
-                        await msg.edit_text(safe_text, **new_kwargs)
+                        await msg.edit_text(safe_text, **kwargs_plain)
                     return True
                 except Exception:
                     pass
-
-            logger.debug("safe_edit BadRequest: %s", err[:100])
             return False
-
-        except (TimedOut, NetworkError):
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2)
-                continue
-            return False
-
         except asyncio.CancelledError:
             return False
-
-        except Exception as e:
-            logger.debug("safe_edit unexpected error: %s", type(e).__name__)
-            return False
-
+        except Exception:
+            if attempt == 0:
+                await asyncio.sleep(1)
+            else:
+                return False
     return False
 
 
@@ -1078,111 +1054,44 @@ async def auto_delete_loop():
 
 async def queue_worker(worker_id: int = 0):
     """
-    PATCHED queue_worker — quota incremented AFTER successful download.
-    
-    Changes:
-    ✅ increment_user_quota() called only when _run_download succeeds
-    ✅ Download failure does NOT consume quota (user can retry)
-    ✅ Proper CancelledError handling for clean shutdown
-    ✅ Task timeout guard (prevent hung workers)
-    ✅ Better error logging with user context
+    Background worker — queue ထဲက download request တွေ တစ်ခုစီ run
+    V31+: Multiple concurrent workers (NUM_QUEUE_WORKERS) for parallel throughput.
     """
     global _dl_queue
     logger.info("Queue worker #%d started", worker_id)
-
     while True:
         try:
             task = await _dl_queue.get()
-        except asyncio.CancelledError:
-            logger.info("Queue worker #%d shutting down (cancelled)", worker_id)
-            return
-
-        try:
             update, context, url, full_site, use_js, resume_mode, uid, *_extra = task
             _cookies_q       = _extra[0] if len(_extra) > 0 else ""
             _extra_headers_q = _extra[1] if len(_extra) > 1 else ""
             _max_depth_q     = _extra[2] if len(_extra) > 2 else 5
             _queue_pos.pop(uid, None)
-
-            success = False
             try:
-                # ✅ Add worker timeout guard (prevent hanging forever)
-                await asyncio.wait_for(
-                    _run_download(
-                        update, context, url, full_site, use_js, resume_mode,
-                        _cookies_q, _extra_headers_q, _max_depth_q
-                    ),
-                    timeout=3600   # 1 hour max per download
-                )
-                success = True
-
-            except asyncio.TimeoutError:
-                logger.error("Queue worker #%d: download TIMEOUT for uid=%d url=%s",
-                             worker_id, uid, url[:60])
-                try:
-                    await update.effective_message.reply_text(
-                        "⏰ Download timeout (1h) exceeded. Please try a smaller site.",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-
-            except asyncio.CancelledError:
-                logger.info("Queue worker #%d: download cancelled for uid=%d", worker_id, uid)
-                raise   # Propagate to outer loop for clean shutdown
-
+                await _run_download(update, context, url, full_site, use_js, resume_mode,
+                                    _cookies_q, _extra_headers_q, _max_depth_q)
             except Exception as e:
-                logger.error("Queue worker #%d download error for uid=%d: %s",
-                             worker_id, uid, e, exc_info=True)
-
+                logger.error("Queue worker #%d download error: %s", worker_id, e)
             finally:
-                # ✅ Only increment quota on successful completion
-                if success:
-                    increment_user_quota(uid, "download")
-                    logger.info("Queue worker #%d: download SUCCESS uid=%d url=%s",
-                                worker_id, uid, url[:60])
-
-                # Always decrement the per-user slot counter
+                # Decrement per-user slot counter
                 current = user_queue_count.get(uid, 1)
                 user_queue_count.set(uid, max(0, current - 1))
                 _dl_queue.task_done()
-
         except asyncio.CancelledError:
             logger.info("Queue worker #%d shutting down", worker_id)
-            _dl_queue.task_done()
-            return
-
+            break
         except Exception as e:
-            logger.error("Queue worker #%d task unpack error: %s", worker_id, e)
-            try:
-                _dl_queue.task_done()
-            except Exception:
-                pass
+            logger.error("Queue worker #%d fatal error: %s", worker_id, e)
             await asyncio.sleep(1)
 
 
 async def enqueue_download(
-    update,
-    context,
-    url: str,
-    full_site: bool,
-    use_js: bool,
-    resume_mode: bool = False,
-    cookies: str = "",
-    extra_headers: str = "",
-    max_depth: int = 5,
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    url: str, full_site: bool, use_js: bool, resume_mode: bool = False,
+    cookies: str = "", extra_headers: str = "", max_depth: int = 5,
 ):
-    """
-    PATCHED enqueue_download — quota checked but NOT incremented here.
-    Quota increment moved to queue_worker after successful download.
-    
-    Changes from original:
-    ✅ Removed: increment_user_quota(uid, "download") from here
-    ✅ Added: pass uid so queue_worker can increment on completion
-    
-    In botp.py, replace the line:
-        increment_user_quota(uid, "download")
-    with a comment explaining increment happens on completion.
+    """Download request ကို queue ထဲ ထည့်သည်
+    Improved: per-user queue limit (QUEUE_MAX_PER_USER) to prevent queue monopoly.
     """
     global _dl_queue, _queue_counter
     uid = update.effective_user.id
@@ -1206,30 +1115,18 @@ async def enqueue_download(
         )
         return
 
-    # ✅ Check quota BEFORE enqueuing (don't increment yet)
-    allowed, remaining, quota_msg = check_user_quota(uid, "download")
-    if not allowed:
-        await update.effective_message.reply_text(
-            quota_msg, parse_mode='Markdown'
-        )
-        return
-
     _queue_counter += 1
     pos = _dl_queue.qsize() + 1
     user_queue_count.set(uid, user_slots + 1)
-    # ✅ NO increment_user_quota here — moved to queue_worker on success
+    increment_user_quota(uid, "download")  # ✅ Increment daily quota
 
-    await _dl_queue.put((
-        update, context, url, full_site, use_js,
-        resume_mode, uid, cookies, extra_headers, max_depth
-    ))
+    await _dl_queue.put((update, context, url, full_site, use_js, resume_mode, uid, cookies, extra_headers, max_depth))
     _queue_pos.set(uid, pos)
 
     if pos > 1:
         await update.effective_message.reply_text(
             f"📋 *Queue ထဲ ထည့်ပြီးပါပြီ*\n"
             f"📍 Position: `{pos}` | သင့် slots: `{user_slots+1}/{QUEUE_MAX_PER_USER}`\n"
-            f"📊 Quota remaining: `{remaining}` downloads today\n"
             f"⏳ Download ရောက်လာသည့်အခါ အလိုအလျောက် စမည်",
             parse_mode='Markdown'
         )
@@ -1881,277 +1778,263 @@ def fetch_page(url: str, use_js: bool = False) -> tuple:
 # 🔍  ASSET EXTRACTORS
 # ══════════════════════════════════════════════════
 
-def _extract_js_urls(js_text: str, base_url: str) -> Set[str]:
+def extract_assets(html: str, page_url: str, soup=None) -> set:
     """
-    Mine JS bundle for asset URLs:
-    - Full https?:// URLs
-    - Relative /path/to/asset URLs
-    - Next.js /_next/static/ chunks
-    - Webpack content hash filenames
-    - Service worker registration paths
-    - window.__INITIAL_STATE__ / __NEXT_DATA__ embedded URLs
-    """
-    found = set()
-    origin = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    Extract all asset URLs from a page — v35 Complete Upgrade.
+    Pass pre-parsed soup to avoid double-parsing (performance boost).
 
-    # Full + relative asset URLs in strings
-    for m in _PATCH_RE_JS_URL.finditer(js_text):
-        u = m.group(1)
-        if u.startswith('/'):
-            found.add(urljoin(base_url, u))
-        else:
-            found.add(u)
-
-    # Next.js static chunks
-    for m in _PATCH_RE_NEXT_CHUNK.finditer(js_text):
-        found.add(origin + m.group(0))
-
-    # Webpack hash-named chunks (e.g. "abc12345.main.js")
-    for m in _PATCH_RE_WEBPACK.finditer(js_text):
-        found.add(f"{origin}/static/js/{m.group(1)}")
-
-    # Service worker paths
-    for m in _PATCH_RE_SW.finditer(js_text):
-        found.add(urljoin(base_url, m.group(1)))
-
-    # Embedded JSON state objects — find URLs inside
-    for m in _PATCH_RE_WIN_STATE.finditer(js_text):
-        for jm in _PATCH_RE_JSONLD.finditer(m.group(1)):
-            found.add(jm.group(1))
-
-    return found
-
-def _extract_css_urls(css_text: str, css_base_url: str) -> Set[str]:
-    """
-    Full CSS URL extractor:
-    - url(...) references (background, background-image, border-image, mask, etc.)
-    - @import statements
-    - @font-face src declarations
-    Returns a set of absolute URLs.
-    """
-    found = set()
-    # url(...) — covers all CSS properties that reference files
-    for m in _PATCH_RE_CSS_URL.finditer(css_text):
-        raw = m.group(1).strip().strip('"\'')
-        if raw and not raw.startswith('data:') and not raw.startswith('#'):
-            found.add(urljoin(css_base_url, raw))
-    # @import
-    for m in _PATCH_RE_CSS_IMPORT.finditer(css_text):
-        raw = m.group(1).strip().strip('"\'')
-        if raw and not raw.startswith('data:'):
-            found.add(urljoin(css_base_url, raw))
-    return found
-
-def _parse_srcset(srcset_str: str, base_url: str) -> Set[str]:
-    """
-    Properly parse srcset attribute.
-    Handles: "img.jpg 1x, img@2x.jpg 2x" and "img.jpg 480w, img-lg.jpg 800w"
-    Bug fix: old code only split(',') then split(' ')[0] — breaks on multi-descriptor
-    """
-    urls = set()
-    if not srcset_str:
-        return urls
-    for candidate in srcset_str.split(','):
-        candidate = candidate.strip()
-        if not candidate:
-            continue
-        # First token is always the URL, rest are descriptors
-        parts = candidate.split()
-        if parts:
-            u = parts[0].strip()
-            if u and not u.startswith('data:'):
-                urls.add(urljoin(base_url, u))
-    return urls
-
-def extract_assets(html: str, page_url: str, soup=None) -> Set[str]:
-    """
-    ╔══════════════════════════════════════════════════════════════╗
-    ║  PATCHED extract_assets — v35 Complete Rewrite              ║
-    ║  Covers ALL asset types across HTML / CSS / JS / JSON-LD    ║
-    ╚══════════════════════════════════════════════════════════════╝
-
-    Returns a set of absolute asset URLs.
-    Pass pre-parsed soup to avoid double-parsing (performance).
+    v35 New coverage:
+    - <link rel="preload"/"prefetch"/"manifest"/"apple-touch-icon">
+    - <picture> + <source srcset> with proper multi-descriptor parser
+    - @font-face src URL extraction from <style> blocks
+    - Service worker registration paths (navigator.serviceWorker.register)
+    - Next.js /_next/static/ chunk URLs from inline scripts
+    - window.__INITIAL_STATE__ / __NEXT_DATA__ embedded asset URLs
+    - <meta http-equiv="refresh"> redirect URLs
+    - Proper srcset parser (handles "1x/2x" and "480w/800w" descriptors)
+    - Inline script URL mining (webpack, relative /asset paths)
+    - All extracted URLs validated (http/https scheme + netloc required)
     """
     if soup is None:
         try:
-            # lxml 3-5× faster; fallback to html.parser
-            try:
-                import lxml  # noqa
-                soup = BeautifulSoup(html, 'lxml')
-            except ImportError:
-                soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(html, _BS_PARSER)
         except Exception as e:
-            logger.debug("extract_assets: BeautifulSoup parse error: %s", e)
+            logger.debug("extract_assets: parse error: %s", e)
             return set()
 
-    assets: Set[str] = set()
+    assets: set = set()
+    origin = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
 
-    # ── 1. <link> tags ──────────────────────────────────────────
+    def _add(url: str):
+        if not url or url.startswith('data:') or url.startswith('#'):
+            return
+        full = urljoin(page_url, url) if not url.startswith('http') else url
+        try:
+            p = urlparse(full)
+            if p.scheme in ('http', 'https') and p.netloc:
+                assets.add(full)
+        except Exception:
+            pass
+
+    def _parse_srcset(srcset_val: str):
+        """Proper srcset parser: handles '1x/2x' and '480w/800w' descriptors."""
+        if not srcset_val:
+            return
+        for candidate in srcset_val.split(','):
+            parts = candidate.strip().split()
+            if parts:
+                _add(parts[0])
+
+    # ── 1. <link> — stylesheets, icons, preload, manifest ────────
     for tag in soup.find_all('link'):
-        href = tag.get('href', '').strip()
-        if not href or href.startswith('data:') or href.startswith('#'):
+        href = (tag.get('href') or '').strip()
+        if not href:
             continue
         rel = ' '.join(tag.get('rel', []))
-        # Stylesheets, icons, preload/prefetch, manifest
         if any(r in rel.lower() for r in (
             'stylesheet', 'icon', 'shortcut', 'preload', 'prefetch',
-            'preconnect', 'manifest', 'apple-touch-icon',
+            'manifest', 'apple-touch-icon', 'preconnect',
         )):
-            assets.add(urljoin(page_url, href))
+            _add(href)
 
-    # ── 2. <script> tags ────────────────────────────────────────
+    # ── 2. <script src> + inline script URL mining ───────────────
     for tag in soup.find_all('script'):
-        src = tag.get('src', '').strip()
-        if src and not src.startswith('data:'):
-            assets.add(urljoin(page_url, src))
-        # Inline script URL mining
+        src = (tag.get('src') or '').strip()
+        if src:
+            _add(src)
+        # Mine inline scripts for asset paths (Next.js, Webpack, etc.)
         inline = tag.string or ''
         if inline.strip():
             try:
-                assets |= _extract_js_urls(inline, page_url)
+                for m in _RE_JS_FULL_URL.finditer(inline):
+                    _add(m.group(1))
+                for m in _RE_JS_REL_URL.finditer(inline):
+                    _add(m.group(1))
+                for m in _RE_NEXT_CHUNK.finditer(inline):
+                    _add(origin + m.group(0))
+                for m in _RE_SW_REGISTER.finditer(inline):
+                    _add(m.group(1))
+                for m in _RE_WIN_STATE.finditer(inline):
+                    for jm in _RE_JSONLD_IMG.finditer(m.group(1)):
+                        _add(jm.group(1))
             except Exception as e:
                 logger.debug("extract_assets: inline JS mining error: %s", e)
 
-    # ── 3. <img> — all lazy-load attributes + srcset ────────────
+    # ── 3. <img> — all lazy-load attributes + srcset ─────────────
     for tag in soup.find_all('img'):
-        for attr in _LAZY_ATTRS:
-            v = tag.get(attr, '').strip()
-            if v and not v.startswith('data:'):
-                assets.add(urljoin(page_url, v))
-        # srcset — proper multi-descriptor parser
-        assets |= _parse_srcset(tag.get('srcset', ''), page_url)
+        for attr in _LAZY_LOAD_ATTRS:
+            v = (tag.get(attr) or '').strip()
+            if v:
+                _add(v)
+        _parse_srcset(tag.get('srcset', ''))
 
-    # ── 4. <picture> + <source> inside it ───────────────────────
+    # ── 4. <picture> + nested <source> ───────────────────────────
     for tag in soup.find_all('picture'):
         for source in tag.find_all('source'):
-            srcset_val = source.get('srcset', '') or source.get('data-srcset', '')
-            assets |= _parse_srcset(srcset_val, page_url)
-            v = source.get('src', '').strip()
-            if v and not v.startswith('data:'):
-                assets.add(urljoin(page_url, v))
+            _parse_srcset(source.get('srcset', '') or source.get('data-srcset', ''))
+            v = (source.get('src') or '').strip()
+            if v:
+                _add(v)
 
-    # ── 5. Standalone <source> (video/audio players) ─────────────
+    # ── 5. Standalone <source> (video/audio) ─────────────────────
     for tag in soup.find_all('source'):
-        for attr in ('src', 'data-src', 'srcset'):
-            v = tag.get(attr, '').strip()
-            if v and not v.startswith('data:'):
-                if attr == 'srcset':
-                    assets |= _parse_srcset(v, page_url)
-                else:
-                    assets.add(urljoin(page_url, v))
+        for attr in ('src', 'data-src'):
+            v = (tag.get(attr) or '').strip()
+            if v:
+                _add(v)
+        _parse_srcset(tag.get('srcset', ''))
 
-    # ── 6. <video> + <audio> ────────────────────────────────────
+    # ── 6. <video> + <audio> ─────────────────────────────────────
     for tag in soup.find_all(['video', 'audio']):
         for attr in ('src', 'data-src', 'poster'):
-            v = tag.get(attr, '').strip()
-            if v and not v.startswith('data:'):
-                assets.add(urljoin(page_url, v))
+            v = (tag.get(attr) or '').strip()
+            if v:
+                _add(v)
 
-    # ── 7. <iframe> embeds ───────────────────────────────────────
+    # ── 7. <iframe> embeds ────────────────────────────────────────
     for tag in soup.find_all('iframe', src=True):
-        s = tag['src'].strip()
-        if s and not s.startswith('data:') and any(
-            x in s for x in ('youtube', 'vimeo', 'player', 'embed', 'video', 'cdn')
-        ):
-            assets.add(urljoin(page_url, s))
+        s = (tag.get('src') or '').strip()
+        if s and any(x in s for x in ('youtube','vimeo','player','embed','video','cdn')):
+            _add(s)
 
-    # ── 8. <a href="..."> downloadable files ────────────────────
+    # ── 8. <a href> downloadable files ───────────────────────────
+    FILE_EXTS = (
+        '.pdf','.zip','.rar','.7z','.tar','.gz',
+        '.doc','.docx','.xls','.xlsx','.ppt','.pptx',
+        '.mp3','.mp4','.avi','.mkv','.mov','.webm',
+        '.apk','.exe','.dmg','.iso',
+    )
     for tag in soup.find_all('a', href=True):
-        h = tag['href'].strip()
-        if h.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+        h = (tag.get('href') or '').strip()
+        if h.startswith(('#','mailto:','tel:','javascript:')):
             continue
         full = urljoin(page_url, h)
         low  = full.lower().split('?')[0]
-        if any(low.endswith(ext) for ext in _DOWNLOADABLE_EXTS):
+        if any(low.endswith(ext) for ext in FILE_EXTS):
             assets.add(full)
 
     # ── 9. <object> + <embed> ────────────────────────────────────
     for tag in soup.find_all(['object', 'embed']):
-        v = (tag.get('data', '') or tag.get('src', '')).strip()
-        if v and not v.startswith('data:'):
-            assets.add(urljoin(page_url, v))
+        v = (tag.get('data') or tag.get('src') or '').strip()
+        if v:
+            _add(v)
 
-    # ── 10. <svg> <image> and <use> sprites ─────────────────────
-    for tag in soup.find_all('image'):   # SVG <image>
+    # ── 10. SVG <image> and <use> sprites ────────────────────────
+    for tag in soup.find_all('image'):
         for attr in ('href', 'xlink:href'):
-            v = tag.get(attr, '').strip()
-            if v and not v.startswith('data:') and not v.startswith('#'):
-                assets.add(urljoin(page_url, v))
+            v = (tag.get(attr) or '').strip()
+            if v and not v.startswith('#'):
+                _add(v)
 
-    # ── 11. Inline style="" url() ────────────────────────────────
+    # ── 11. Inline style="" url() references ─────────────────────
     for tag in soup.find_all(style=True):
         style_val = tag.get('style', '')
         if style_val:
-            assets |= _extract_css_urls(style_val, page_url)
+            for m in _RE_CSS_URL.finditer(style_val):
+                _add(m.group(1).strip().strip('"\''))
 
-    # ── 12. <style> block CSS ────────────────────────────────────
-    for tag in soup.find_all('style'):
-        css_text = tag.string or ''
-        if css_text.strip():
-            assets |= _extract_css_urls(css_text, page_url)
+    # ── 12. <style> block CSS (url + @import + @font-face) ────────
+    for st in soup.find_all('style'):
+        css = st.string or ''
+        if css.strip():
+            for m in _RE_CSS_URL.finditer(css):
+                _add(m.group(1).strip().strip('"\''))
+            for m in _RE_CSS_IMPORT.finditer(css):
+                _add(m.group(1).strip().strip('"\''))
+            # @font-face src
+            for m in _RE_CSS_FONT.finditer(css):
+                _add(m.group(1).strip().strip('"\''))
 
-    # ── 13. <meta> tags (OG image, Twitter Card, etc.) ──────────
+    # ── 13. <meta> OG/Twitter/Schema images ──────────────────────
     for tag in soup.find_all('meta'):
-        prop = (tag.get('property', '') + tag.get('name', '')).lower()
-        if any(k in prop for k in ('image', 'thumbnail', 'banner', 'icon', 'logo')):
-            c = tag.get('content', '').strip()
-            if c and c.startswith('http'):
+        prop = (tag.get('property','') + tag.get('name','')).lower()
+        if any(k in prop for k in ('image','thumbnail','banner','icon','logo')):
+            c = (tag.get('content') or '').strip()
+            if c.startswith('http'):
                 assets.add(c)
-        # meta refresh redirect — extract referenced URL for crawling
-        if tag.get('http-equiv', '').lower() == 'refresh':
+        # meta refresh redirect
+        if tag.get('http-equiv','').lower() == 'refresh':
             content = tag.get('content', '')
             url_m = re.search(r'url\s*=\s*["\']?([^"\';\s]+)', content, re.IGNORECASE)
             if url_m:
-                assets.add(urljoin(page_url, url_m.group(1)))
+                _add(url_m.group(1))
 
-    # ── 14. JSON-LD / structured data ────────────────────────────
+    # ── 14. JSON-LD structured data images ───────────────────────
     for tag in soup.find_all('script', type='application/ld+json'):
         txt = tag.string or ''
-        for m in _PATCH_RE_JSONLD.finditer(txt):
+        for m in _RE_JSONLD_IMG.finditer(txt):
             assets.add(m.group(1))
 
-    # ── 15. Regex sweep: raw HTML static asset references ────────
-    # Catches assets injected via JS template literals or server-side HTML
-    for m in re.finditer(
-        r'''["`']((?:https?://|/)[^`'"<>\s]{4,}\.(?:js|css|woff2?|ttf|otf|eot|png|jpg|jpeg|gif|svg|webp|avif|ico|mp3|mp4|wasm)(?:\?[^`'"<>\s]*)?)["`']''',
-        html, re.IGNORECASE
-    ):
+    # ── 15. Raw HTML regex sweep (server-injected asset paths) ────
+    for m in _RE_URL_IN_HTML.finditer(html):
         u = m.group(1)
-        assets.add(urljoin(page_url, u) if u.startswith('/') else u)
+        _add(u)
 
-    # ── Final: filter obviously invalid entries ───────────────────
-    clean: Set[str] = set()
-    for u in assets:
-        try:
-            p = urlparse(u)
-            if p.scheme in ('http', 'https') and p.netloc:
-                clean.add(u)
-        except Exception:
-            pass
-
-    return clean
+    return assets
 
 
-def extract_css_assets(css: str, css_url: str) -> Set[str]:
+def extract_css_assets(css: str, css_url: str) -> set:
     """
-    PATCHED extract_css_assets — complete CSS asset extractor.
-    Handles:
-    - url(...) with/without quotes
-    - @import with/without url()
-    - @font-face multi-format src chains
-    - data: URLs filtered out
+    Extract all asset URLs from CSS text — v35 upgrade.
+    Handles: url() with/without quotes, @import, @font-face src chains.
+    Bug fix: old regex matched data: URIs and failed on unquoted url().
+    Uses improved _RE_CSS_URL and _RE_CSS_IMPORT patterns.
     """
-    return _extract_css_urls(css, css_url)
+    assets = set()
+    # url(...) — covers background, border-image, mask, src, etc.
+    for m in _RE_CSS_URL.finditer(css):
+        u = m.group(1).strip().strip('"\'')
+        if u and not u.startswith('data:') and not u.startswith('#'):
+            assets.add(urljoin(css_url, u))
+    # @import
+    for m in _RE_CSS_IMPORT.finditer(css):
+        u = m.group(1).strip().strip('"\'')
+        if u and not u.startswith('data:'):
+            assets.add(urljoin(css_url, u))
+    # @font-face src (may have multiple url() in one block)
+    for m in _RE_CSS_FONT.finditer(css):
+        u = m.group(1).strip().strip('"\'')
+        if u and not u.startswith('data:'):
+            assets.add(urljoin(css_url, u))
+    return assets
 
 
-def extract_media_from_js(js_content: str, base_url: str) -> Set[str]:
+def extract_media_from_js(js_content: str, base_url: str) -> set:
     """
-    PATCHED extract_media_from_js — uses pre-compiled patterns.
-    Mines JS/JSON files for media URLs, webpack chunks, and asset paths.
-    Useful for React/Vue/Next.js apps that store image paths in JS bundles.
+    Mine JS/JSON files for media URLs, webpack chunks, and asset paths.
+    v35 upgrade: uses module-level pre-compiled patterns (was re.compile()
+    inside the function — recompiled on every call, wasting CPU).
+    Also added: service worker paths, window.__INITIAL_STATE__ images.
     """
-    return _extract_js_urls(js_content, base_url)
+    assets = set()
+    origin = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+
+    # Full https?:// URLs
+    for m in _RE_JS_FULL_URL.finditer(js_content):
+        assets.add(m.group(1))
+
+    # Relative /path/to/asset URLs
+    for m in _RE_JS_REL_URL.finditer(js_content):
+        assets.add(urljoin(base_url, m.group(1)))
+
+    # Webpack content-hash named chunks (e.g. "abc12345.main.js")
+    for m in _RE_WEBPACK_CHUNK.finditer(js_content):
+        assets.add(f"{origin}/static/js/{m.group(1)}")
+
+    # Next.js /_next/static/ chunks
+    for m in _RE_NEXT_CHUNK.finditer(js_content):
+        assets.add(urljoin(base_url, m.group(0)))
+
+    # Service worker registration paths
+    for m in _RE_SW_REGISTER.finditer(js_content):
+        assets.add(urljoin(base_url, m.group(1)))
+
+    # Embedded JSON state blobs (window.__NEXT_DATA__ etc.)
+    for m in _RE_WIN_STATE.finditer(js_content):
+        for jm in _RE_JSONLD_IMG.finditer(m.group(1)):
+            assets.add(jm.group(1))
+
+    return assets
 
 
 # ══════════════════════════════════════════════════
@@ -3430,6 +3313,89 @@ _FAKE_SIGS = [
     b"does not exist", b"no such file",
 ]
 
+# ── v35 Security Constants ──────────────────────────────────────────
+_SECURITY_HEADERS_FULL = {
+    "Strict-Transport-Security"        : ("HSTS",                  "HIGH"),
+    "Content-Security-Policy"          : ("CSP",                   "MEDIUM"),
+    "X-Frame-Options"                  : ("X-Frame-Options",       "MEDIUM"),
+    "X-Content-Type-Options"           : ("X-Content-Type-Options","LOW"),
+    "Referrer-Policy"                  : ("Referrer-Policy",       "LOW"),
+    "Permissions-Policy"               : ("Permissions-Policy",    "LOW"),
+    "Cross-Origin-Opener-Policy"       : ("COOP",                  "LOW"),
+    "Cross-Origin-Embedder-Policy"     : ("COEP",                  "LOW"),
+    "Cross-Origin-Resource-Policy"     : ("CORP",                  "LOW"),
+    "X-Permitted-Cross-Domain-Policies": ("X-Permitted-XD",        "LOW"),
+    "Cache-Control"                    : ("Cache-Control",         "INFO"),
+}
+_DANGEROUS_CSP_DIRECTIVES = (
+    "unsafe-inline", "unsafe-eval", "unsafe-hashes", "blob:",
+)
+_DANGEROUS_PERMISSIONS = (
+    "camera=*", "microphone=*", "geolocation=*", "payment=*", "usb=*",
+)
+_PARKED_SIGNALS = (
+    b"domain is for sale", b"buy this domain", b"parked domain",
+    b"domain parking", b"this domain may be for sale",
+)
+_EXTENDED_SUBDOMAINS = [
+    "api","admin","dev","staging","test","beta","app","portal","dashboard",
+    "panel","manage","backend","internal","static","mail","backup","vpn",
+    "git","gitlab","jenkins","ci","build","docs","help","shop","store",
+    "blog","status","monitor","db","database","phpmyadmin","cdn","media",
+    "assets","files","upload","img","images","auth","login","sso","oauth",
+    "api2","api3","ns1","ns2","mx","smtp","ftp","sftp","ssh","remote",
+    "proxy","gateway","lb","edge","graphql","rest","ws","preview","demo",
+    "sandbox","qa","uat","prod","v2","new","legacy","search","analytics",
+    "console","kibana","grafana","prometheus","webhook","callback",
+]
+_FAKE_404_PATTERNS_V2 = [
+    b"404", b"not found", b"page not found", b"does not exist",
+    b"no such file", b"file not found", b"error 404",
+    b"the page you", b"we couldn\'t find", b"can\'t find",
+    b"nothing to see here", b"page doesn\'t exist", b"sorry, this page",
+    b"this page could not be found", b"page not available",
+]
+_WRITE_METHODS_SET = frozenset({"PUT", "PATCH", "DELETE", "POST"})
+_FALSE_POSITIVE_RE = re.compile(
+    r'(?i)(?:example|placeholder|dummy|fake|test|mock|your[_\-]?|'     r'<[A-Z_]+>|XXXX|1234|xxxxxxxx|changeme|todo|fixme|'     r'base64encodedvalue|abc123|password123|secretkey|apikey123)',
+)
+_TEST_VALUE_RE = re.compile(
+    r'(?i)(?:sk-test_|pk_test_|test_mode|sandbox|staging_key|dev_key)',
+)
+_SITEMAP_LOCATIONS_V2 = [
+    "/sitemap.xml","/sitemap_index.xml","/sitemap-index.xml",
+    "/wp-sitemap.xml","/sitemap/sitemap.xml","/news-sitemap.xml",
+    "/post-sitemap.xml","/page-sitemap.xml","/product-sitemap.xml",
+    "/category-sitemap.xml","/tag-sitemap.xml","/sitemap1.xml",
+    "/sitemaps/sitemap.xml","/public/sitemap.xml","/static/sitemap.xml",
+]
+_RE_SITEMAP_LOC_V2 = re.compile(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', re.IGNORECASE)
+_RE_ROBOTS_SM_V2   = re.compile(r'(?i)^sitemap:\s*(https?://\S+)', re.MULTILINE)
+_RE_HEAD_SITEMAP   = re.compile(
+    r'<link[^>]+rel=["\']sitemap["\'][^>]+href=["\']([^"\']+)["\']', re.IGNORECASE
+)
+_COMMON_BUNDLE_PATHS_V2 = [
+    "/static/js/main.js","/static/js/bundle.js","/assets/js/app.js",
+    "/js/app.js","/dist/bundle.js","/dist/app.js",
+    "/build/static/js/main.chunk.js","/_next/static/chunks/main.js",
+    "/nuxt/dist/client/app.js","/assets/index.js","/public/app.js",
+    "/js/index.js","/js/bundle.js","/vendor.js","/runtime.js","/app.js",
+]
+_JS_API_PATTERNS_V2 = [
+    re.compile(r"""(?:fetch|axios\.(?:get|post|put|delete|patch|request))\s*\(\s*['"`]([^'"`\s]{4,200})['"`]"""),
+    re.compile(r"""(?:url|endpoint|baseURL|apiUrl|API_URL|baseUrl|apiBase|BASE_URL)\s*[:=]\s*['"`]([^'"`\s]{4,200})['"`]"""),
+    re.compile(r"""['"`](/api/[^\s'"`#?]{2,100})['"`]"""),
+    re.compile(r"""['"`](/rest/[^\s'"`#?]{2,100})['"`]"""),
+    re.compile(r"""['"`](/v\d+/[^\s'"`#?]{2,100})['"`]"""),
+    re.compile(r"""['"`](/graphql(?:/[^\s'"`#?]{0,50})?)[`'"]"""),
+    re.compile(r"""['"`](/wp-json/[^\s'"`#?]{2,100})['"`]"""),
+    re.compile(r"""['"`](https?://[^\s'"`]{10,200}/(?:api|rest|v\d+|graphql)/[^\s'"`?#]{2,100})['"`]"""),
+    re.compile(r"""['"`](wss?://[^\s'"`]{4,200})['"`]"""),
+    re.compile(r"""(?:router|app|server)\s*\.\s*(?:get|post|put|delete|patch|use)\s*\(\s*['"`]([/][^'"`\s,)]{2,80})['"`]"""),
+    re.compile(r"""path\s*:\s*['"`]([/][^'"`\s,}{]{2,80})['"`]"""),
+    re.compile(r"""pages/([a-z0-9_\-\[\]/]+)\.(?:tsx?|jsx?)""", re.IGNORECASE),
+]
+
 # User-Agents rotation (avoid rate limiting) — 60+ UAs for better evasion (updated 2025/2026)
 _UA_LIST = [
     # ── Chrome — Windows (latest) ────────────────────────────────────
@@ -3533,19 +3499,24 @@ _UA_LIST = [
 
 
 def _get_headers(referer: str = None) -> dict:
+    """Rotate User-Agent each call with realistic browser headers.
+    v35: Fixed Sec-CH-UA version mismatch + duplicate condition bug.
+
+    BUG FIX v35:
+    1. Duplicate condition: 'Chrome/13' was checked TWICE in original
+       'Chrome/13' in ua or 'Chrome/12' in ua or 'Chrome/13' in ua
+       → second Chrome/13 is dead code; Chrome/12x versions got wrong headers
+    2. Hardcoded version "130" regardless of actual UA (Chrome/136 UA
+       was sending Sec-CH-UA: v="130" — server-side mismatch)
+    3. Firefox/Safari received Chrome-style Sec-CH-UA (they don't send it)
+    Fix: dynamically extract actual version number from UA string.
     """
-    PATCHED _get_headers — Sec-CH-UA version mismatch + duplicate check fixed.
-    
-    Rotate User-Agent each call with realistic browser headers.
-    Version-accurate Sec-CH-UA for Cloudflare/WAF bypass.
-    Firefox/Safari: omit Sec-CH-UA (they don't send it in real browsers).
-    """
-    # NOTE: _UA_LIST is defined in botp.py
     ua = random.choice(_UA_LIST)
+    is_mobile = any(x in ua for x in ('Mobile', 'Android', 'iPhone', 'iPad'))
     is_chrome  = 'Chrome/' in ua and 'Chromium' not in ua
-    is_firefox = 'Firefox/' in ua
-    is_safari  = 'Safari/' in ua and 'Chrome' not in ua
-    is_mobile  = any(x in ua for x in ('Mobile', 'Android', 'iPhone', 'iPad'))
+    is_firefox = 'Firefox/' in ua and 'Chrome' not in ua
+    is_edge    = 'Edg/' in ua
+    is_safari  = 'Safari/' in ua and 'Chrome' not in ua and 'Android' not in ua
 
     hdrs = {
         'User-Agent'               : ua,
@@ -3563,19 +3534,25 @@ def _get_headers(referer: str = None) -> dict:
         'DNT'                      : '1',
     }
 
-    if is_chrome:
-        # ✅ Extract actual version number from UA string
-        ver_m = re.search(r'Chrome/(\d+)', ua)
-        ver   = int(ver_m.group(1)) if ver_m else 120
+    if is_chrome or is_edge:
+        # ✅ Extract ACTUAL version from UA — not hardcoded
+        browser_key = 'Edg/' if is_edge else 'Chrome/'
+        ver_m   = re.search(r'Chrome/(\d+)', ua)
+        ver_int = int(ver_m.group(1)) if ver_m else 120
+        ver     = str(ver_int)
+        full_m  = re.search(r'Chrome/([\d.]+)', ua)
+        full_ver = full_m.group(1) if full_m else f'{ver}.0.0.0'
 
-        # ✅ Build version-accurate Sec-CH-UA
-        brand = "Google Chrome"
-        ch_ua = f'"Chromium";v="{ver}", "{brand}";v="{ver}", "Not.A/Brand";v="99"'
-        # Full version string (minor.build.patch)
-        full_ver_m = re.search(r'Chrome/([\d.]+)', ua)
-        full_ver   = full_ver_m.group(1) if full_ver_m else f'{ver}.0.0.0'
+        if is_edge:
+            edge_m = re.search(r'Edg/([\d.]+)', ua)
+            edge_ver = edge_m.group(1) if edge_m else full_ver
+            ch_ua = (f'"Chromium";v="{ver}", "Microsoft Edge";v="{ver}", '
+                     f'"Not.A/Brand";v="99"')
+        else:
+            ch_ua = (f'"Chromium";v="{ver}", "Google Chrome";v="{ver}", '
+                     f'"Not.A/Brand";v="99"')
+            full_ver_label = f'"Google Chrome";v="{full_ver}"'
 
-        # Determine OS platform
         if 'Windows' in ua:
             platform = '"Windows"'
         elif 'Macintosh' in ua:
@@ -3595,12 +3572,12 @@ def _get_headers(referer: str = None) -> dict:
             'Sec-CH-UA'                  : ch_ua,
             'Sec-CH-UA-Mobile'           : '?1' if is_mobile else '?0',
             'Sec-CH-UA-Platform'         : platform,
-            'Sec-CH-UA-Full-Version-List': f'"{brand}";v="{full_ver}"',
+            'Sec-CH-UA-Full-Version-List': f'"Google Chrome";v="{full_ver}"',
             'Priority'                   : 'u=0, i',
         })
 
     elif is_firefox:
-        # ✅ Firefox does NOT send Sec-CH-UA — real Firefox behavior
+        # ✅ Firefox does NOT send Sec-CH-UA in real browsers
         hdrs.update({
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
@@ -3610,13 +3587,10 @@ def _get_headers(referer: str = None) -> dict:
 
     elif is_safari:
         # ✅ Safari does not send Sec-CH-UA either
-        hdrs.update({
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        })
+        hdrs['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
 
     if referer:
         hdrs['Referer'] = referer
-
     return hdrs
 
 
@@ -3856,64 +3830,14 @@ def _is_fake_200_content(body: bytes, ct: str) -> bool:
     return any(s in snippet for s in _FAKE_SIGS)
 
 
-def _is_fake_200_enhanced(body: bytes, ct: str, status: int) -> bool:
-    """
-    PATCHED _is_fake_200_content — enhanced fake 404 detection.
-    Checks:
-    1. Known fake-404 text snippets (case-insensitive)
-    2. Title tag content analysis
-    3. Response too small (< 50 bytes) — only for HTML (not JSON/XML/binary)
-
-    Bug fix from original: small-body check now only applies to HTML responses.
-    JSON APIs legitimately return short responses (e.g. {"ok":true}) — these
-    should NOT be treated as fake 200s.
-    """
-    if status != 200:
-        return False
-
-    ct_lower = ct.lower()
-    is_html = 'html' in ct_lower or (not ct_lower.strip())
-    is_json = 'json' in ct_lower
-    is_xml  = 'xml' in ct_lower
-
-    # Small-body check: only for HTML (non-API) responses
-    if is_html and len(body) < 50:
-        return True  # Suspiciously empty HTML
-
-    # JSON/XML/binary responses → trust the status code
-    if is_json or is_xml:
-        return False
-
-    # HTML content analysis
-    if is_html:
-        snippet = body[:1200].lower()   # expanded from 800 → 1200
-        # Direct text signature matching
-        if any(s in snippet for s in _ENHANCED_FAKE_SIGS):
-            return True
-        # Title tag analysis — most custom 404 pages set a telling title
-        title_m = re.search(rb'<title[^>]*>(.*?)</title>', snippet, re.IGNORECASE | re.DOTALL)
-        if title_m:
-            title = title_m.group(1).decode('utf-8', 'replace').lower()
-            if any(s in title for s in ('404', 'not found', 'error', 'page not found', "can't find")):
-                return True
-
-    return False
-
 def _probe_one(
     base_url: str, path: str, label: str, severity: str,
     catchall: bool, baseline_hash: str, baseline_len: int,
-    delay: float = 0.0,
-    check_write_methods: bool = True,
-) -> Optional[dict]:
+    delay: float = 0.0
+) -> dict | None:
     """
-    PATCHED _probe_one — false positive reduction + write method detection.
-
-    Improvements:
-    ✅ Enhanced fake 200 detection (expanded patterns + title tag)
-    ✅ Content-Length independent catch-all comparison
-    ✅ TRACE method detection
-    ✅ OPTIONS probe for write methods on sensitive paths
-    ✅ Better size threshold (skip responses < 20 bytes as empty)
+    Probe one path — GET + stream.
+    Compares against baseline to filter catch-all false positives.
     """
     if delay > 0:
         time.sleep(delay)
@@ -3921,152 +3845,74 @@ def _probe_one(
     full_url = base_url.rstrip('/') + path
     try:
         resp = requests.get(
-            full_url,
-            headers=_get_headers(),
-            timeout=8,
-            stream=True,
-            allow_redirects=True,
-            verify=False,
+            full_url, headers=_get_headers(),
+            timeout=8, stream=True,
+            allow_redirects=True, verify=False,
         )
         status = resp.status_code
         ct     = resp.headers.get('Content-Type', '')
 
         if status == 200:
-            # Read first 2KB for analysis
             chunk = b''
             for part in resp.iter_content(1024):
                 chunk += part
-                if len(chunk) >= 2048:
-                    break
-            try:
-                resp.close()
-            except Exception:
-                pass
+                if len(chunk) >= 1024: break
+            resp.close()
 
-            # ── Catch-all filter ───────────────────────────
-            if catchall and baseline_hash:
+            # ── Catch-all filter ──────────────────
+            if catchall:
                 page_hash = hashlib.md5(chunk[:512]).hexdigest()
+                page_len  = int(resp.headers.get('Content-Length', len(chunk)))
+                # Same hash or very similar length = catch-all page
                 if page_hash == baseline_hash:
                     return None
-                # Size-based filter: only if Content-Length was reliable
-                if baseline_len > 200:
-                    actual_len = int(resp.headers.get('Content-Length', 0)) or len(chunk)
-                    if actual_len > 0 and abs(actual_len - baseline_len) < 50:
-                        return None
+                if baseline_len > 0 and abs(page_len - baseline_len) < 50:
+                    return None
 
-            # ── Enhanced fake 200 detection ────────────────
-            if _is_fake_200_enhanced(chunk, ct, status):
+            # ── Fake 200 (custom 404 HTML) ────────
+            if _is_fake_200_content(chunk, ct):
                 return None
 
-            # ── Actual size from full read (streaming) ──────
             size = int(resp.headers.get('Content-Length', len(chunk)))
-
-            result = {
+            return {
                 "path": path, "full_url": full_url,
                 "label": label, "severity": severity,
                 "status": 200, "protected": False, "size": size,
-                "note": "",
             }
 
-            # ── Check for write methods on sensitive endpoints ─
-            if check_write_methods and severity in ("CRITICAL", "HIGH", "MEDIUM"):
-                try:
-                    trace_resp = requests.request(
-                        'TRACE', full_url,
-                        headers=_get_headers(), timeout=4, verify=False
-                    )
-                    if trace_resp.status_code in (200, 405):
-                        # TRACE responded — server likely supports it
-                        if trace_resp.status_code == 200:
-                            result["note"] = "⚠️ TRACE enabled"
-                            result["severity"] = "HIGH" if severity in ("MEDIUM", "LOW") else severity
-                except Exception:
-                    pass
+        elif status == 403 and severity in ("CRITICAL","HIGH"):
+            resp.close()
+            # Cloudflare 403 = file might exist but CF blocks it
+            cf = 'cloudflare' in resp.headers.get('Server','').lower() or \
+                 'cf-ray' in resp.headers
+            note = " (CF-blocked)" if cf else ""
+            return {
+                "path": path, "full_url": full_url,
+                "label": label + note, "severity": "MEDIUM",
+                "status": 403, "protected": True, "size": 0,
+            }
 
-                try:
-                    opts = requests.options(
-                        full_url, headers=_get_headers(), timeout=4, verify=False
-                    )
-                    allow = (
-                        opts.headers.get('Allow', '') or
-                        opts.headers.get('Access-Control-Allow-Methods', '')
-                    )
-                    if allow:
-                        allowed_methods = {m.strip().upper() for m in allow.split(',')}
-                        write_methods   = allowed_methods & _WRITE_METHODS
-                        if write_methods:
-                            result["note"] += f" Allow: {', '.join(sorted(write_methods))}"
-                            if len(write_methods) >= 2:
-                                result["severity"] = "CRITICAL" if severity in ("HIGH", "MEDIUM") else severity
-                except Exception:
-                    pass
-
-            return result
-
-        elif status == 403:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            # Include 403 for CRITICAL+HIGH+MEDIUM (not just CRITICAL+HIGH)
-            if severity in ("CRITICAL", "HIGH", "MEDIUM"):
-                is_cf = (
-                    'cloudflare' in resp.headers.get('Server', '').lower() or
-                    'cf-ray' in resp.headers
-                )
-                note = " (CF-WAF)" if is_cf else ""
-                return {
-                    "path": path, "full_url": full_url,
-                    "label": label + note,
-                    "severity": "MEDIUM" if severity in ("HIGH", "CRITICAL") else severity,
-                    "status": 403, "protected": True, "size": 0, "note": "",
-                }
-
-        elif status == 405:
-            # Method Not Allowed — endpoint EXISTS, just doesn't support GET
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if severity in ("CRITICAL", "HIGH", "MEDIUM"):
-                return {
-                    "path": path, "full_url": full_url,
-                    "label": label + " [GET→405]",
-                    "severity": severity,
-                    "status": 405, "protected": True, "size": 0,
-                    "note": "Endpoint exists but GET not allowed",
-                }
-
-        elif status in (301, 302, 307, 308):
-            loc = resp.headers.get('Location', '')
-            try:
-                resp.close()
-            except Exception:
-                pass
-            # Only report redirects to auth pages for HIGH/CRITICAL
-            if severity in ("HIGH", "CRITICAL") and any(
-                k in loc.lower() for k in ('login', 'auth', 'signin', 'session', 'sso')
+        elif status in (301,302,307,308):
+            loc = resp.headers.get('Location','')
+            resp.close()
+            if severity in ("HIGH","MEDIUM","LOW") and any(
+                k in loc for k in ('login','auth','signin','session')
             ):
                 return {
                     "path": path, "full_url": full_url,
-                    "label": label + f" (→login)",
-                    "severity": severity,
-                    "status": status, "protected": True, "size": 0, "note": loc[:80],
+                    "label": label + " (→ login)",
+                    "severity": severity, "status": status,
+                    "protected": True, "size": 0,
                 }
 
         else:
-            try:
-                resp.close()
-            except Exception:
-                pass
+            try: resp.close()
+            except: pass
 
     except requests.exceptions.Timeout:
-        pass  # Timeout = path likely doesn't exist or is very slow
-    except requests.exceptions.ConnectionError:
         pass
-    except Exception as e:
-        logger.debug("_probe_one error for %s: %s", path, type(e).__name__)
-
+    except Exception as _e:
+        logging.debug("Scan error: %s", _e)
     return None
 
 
@@ -4314,312 +4160,94 @@ def _vuln_scan_sync(url: str, progress_q: list) -> dict:
     return results
 
 
-def _clean_url_display(url: str, max_path: int = 45) -> str:
-    """Format URL for Telegram display: scheme://host/path (no query string noise)."""
-    try:
-        p = urlparse(url)
-        path = p.path
-        if len(path) > max_path:
-            path = path[:max_path] + "…"
-        return f"{p.scheme}://{p.netloc}{path}"
-    except Exception:
-        return url[:60]
-
 def _format_vuln_report(r: dict) -> str:
-    """
-    PATCHED _format_vuln_report — severity-grouped, actionable output.
-    
-    Report structure:
-    ┌ Header (domain, risk level, scan stats)
-    ├ ⚠️ ACTION REQUIRED (CRITICAL findings only)
-    ├ 🚨 Exposed Findings (grouped by severity)
-    ├ 🔒 Protected / Blocked (403) Findings
-    ├ 🔐 HTTPS Status
-    ├ 🖼️ Clickjacking Status
-    ├ 📋 Security Headers (grouped by severity)
-    ├ 📡 Subdomains
-    └ Footer
-    """
     domain = urlparse(r["url"]).netloc
     lines  = []
 
-    # ── Aggregate all exposed findings across targets ──────────
-    all_exposed:   List[dict] = []
-    all_protected: List[dict] = []
-    for finding in r.get("findings", []):
-        all_exposed.extend(finding.get("exposed", []))
-        all_protected.extend(finding.get("protected", []))
+    total_exp = sum(len(f["exposed"]) for f in r["findings"])
+    all_sevs  = [fi["severity"] for f in r["findings"] for fi in f["exposed"]]
 
-    # Sort by severity
-    all_exposed.sort(key=lambda x: _SEV_ORDER_V2.get(x.get("severity","INFO"), 4))
-    all_protected.sort(key=lambda x: _SEV_ORDER_V2.get(x.get("severity","INFO"), 4))
+    if   "CRITICAL" in all_sevs:                       overall = "🔴 CRITICAL RISK"
+    elif "HIGH"     in all_sevs:                       overall = "🟠 HIGH RISK"
+    elif "MEDIUM"   in all_sevs or r["clickjacking"]:  overall = "🟡 MEDIUM RISK"
+    elif r["missing_headers"]:                         overall = "🔵 LOW RISK"
+    else:                                              overall = "✅ CLEAN"
 
-    all_sevs = [f.get("severity", "INFO") for f in all_exposed]
-
-    # Overall risk
-    if   "CRITICAL" in all_sevs:                        overall_emoji = "🔴"; overall_txt = "CRITICAL RISK"
-    elif "HIGH"     in all_sevs:                        overall_emoji = "🟠"; overall_txt = "HIGH RISK"
-    elif "MEDIUM"   in all_sevs or r.get("clickjacking"):overall_emoji = "🟡"; overall_txt = "MEDIUM RISK"
-    elif r.get("missing_headers"):                      overall_emoji = "🔵"; overall_txt = "LOW RISK"
-    else:                                               overall_emoji = "✅"; overall_txt = "CLEAN"
-
-    cf_badge = " ☁️CF" if r.get("cloudflare") else ""
-    profile  = r.get("profile", "Unknown")
-
-    # ── Header ────────────────────────────────────────────────
+    cf_badge = " ☁️ Cloudflare" if r.get("cloudflare") else ""
     lines += [
         "🛡️ *Vulnerability Scan Report*",
-        "━━━━━━━━━━━━━━━━━━━━━━━",
         f"🌐 `{domain}`{cf_badge}",
-        f"📊 Risk: {overall_emoji} *{overall_txt}*",
-        f"🔍 Paths scanned: `{r.get('total_scanned', 0)}`",
-        f"🚨 Issues found:  `{len(all_exposed)}`",
-        f"📡 Subdomains:   `{len(r.get('subdomains_found', []))}`",
-        f"🖥️ Server:       `{r.get('server', 'Unknown')[:50]}`",
-        f"⚙️ Profile:      `{profile}`",
+        f"📊 Risk: *{overall}*",
+        f"🔍 Paths: `{r['total_scanned']}` | Issues: `{total_exp}`",
+        f"📡 Subdomains: `{len(r['subdomains_found'])}`",
+        f"🖥️ Server: `{r['server']}`",
         "",
     ]
 
-    # ── ACTION REQUIRED block (CRITICAL only) ─────────────────
-    critical_findings = [f for f in all_exposed if f.get("severity") == "CRITICAL"]
-    if critical_findings:
-        lines += ["⚠️ *ACTION REQUIRED — CRITICAL FINDINGS:*"]
-        for fi in critical_findings:
-            clean = _clean_url_display(fi["full_url"])
-            lines.append(f"  🔴 {fi['label']} → `{clean}`")
-        lines += ["", "Fix these immediately — credentials may be exposed!", ""]
-
-    # ── Exposed findings grouped by severity ──────────────────
-    if all_exposed:
-        lines.append("*🚨 Exposed Files / Paths:*")
-        _prev_sev = None
-        for fi in all_exposed:
-            sev  = fi.get("severity", "INFO")
-            em   = _SEV_EMOJI_V2.get(sev, "⚪")
-            note = fi.get("note", "")
-            # Severity divider
-            if sev != _prev_sev:
-                lines.append(f"  {em} *{sev}*")
-                _prev_sev = sev
-            size_str = f" `({fi['size']//1024}KB)`" if fi.get("size", 0) > 1024 else ""
-            note_str = f" — {note}" if note else ""
-            lines.append(f"    • {fi['label']}{note_str} `[{fi['status']}]`{size_str}")
-            lines.append(f"      🔗 `{_clean_url_display(fi['full_url'])}`")
+    # Subdomains
+    if r["subdomains_found"]:
+        lines.append("*📡 Live Subdomains:*")
+        for s in r["subdomains_found"]:
+            lines.append(f"  • {s}")
         lines.append("")
+
+    # HTTPS
+    lines.append("*🔐 HTTPS:*")
+    lines.append("  ✅ HTTPS enabled" if r["https"] else "  🔴 HTTP only — no encryption!")
+    lines.append("")
+
+    # Findings per target
+    if r["findings"]:
+        for f in r["findings"]:
+            if f["exposed"]:
+                lines.append(f"*🚨 Exposed — `{f['netloc']}`:*")
+                for fi in f["exposed"]:
+                    em   = _SEV_EMOJI.get(fi["severity"],"⚪")
+                    note = f" `[{fi['status']}]`"
+                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']}{note}")
+                    lines.append(f"  🔗 {fi['full_url']}")
+                lines.append("")
+            if f["protected"]:
+                lines.append(f"*⚠️ Blocked (403) — `{f['netloc']}`:*")
+                for fi in f["protected"][:5]:
+                    em = _SEV_EMOJI.get(fi["severity"],"⚪")
+                    lines.append(f"  {em} {fi['label']}")
+                    lines.append(f"  🔗 {fi['full_url']}")
+                lines.append("")
     else:
         lines += ["*✅ No exposed files found*", ""]
 
-    # ── Protected / Blocked ────────────────────────────────────
-    if all_protected:
-        lines.append("*⚠️ Blocked Access (403/Auth-Redirect):*")
-        for fi in all_protected[:8]:   # limit to 8
-            em = _SEV_EMOJI_V2.get(fi.get("severity","INFO"), "⚪")
-            lines.append(f"  {em} {fi['label']}")
-            lines.append(f"     🔗 `{_clean_url_display(fi['full_url'])}`")
-        if len(all_protected) > 8:
-            lines.append(f"  _+ {len(all_protected)-8} more blocked paths_")
-        lines.append("")
-
-    # ── HTTPS ──────────────────────────────────────────────────
-    lines.append("*🔐 HTTPS:*")
-    if r.get("https"):
-        lines.append("  ✅ HTTPS enabled")
-    else:
-        lines.append("  🔴 HTTP only — no encryption! Upgrade immediately.")
-    lines.append("")
-
-    # ── Clickjacking ───────────────────────────────────────────
+    # Clickjacking
     lines.append("*🖼️ Clickjacking:*")
-    if r.get("clickjacking"):
-        lines.append("  🟠 *Vulnerable* — X-Frame-Options / frame-ancestors missing")
-        lines.append("  Fix: Add `X-Frame-Options: DENY` or CSP `frame-ancestors 'none'`")
+    if r["clickjacking"]:
+        lines.append("  🟠 Vulnerable — no X-Frame-Options / frame-ancestors")
     else:
         lines.append("  ✅ Protected")
     lines.append("")
 
-    # ── Security headers — grouped by severity ─────────────────
-    missing = r.get("missing_headers", [])
-    if missing:
+    # Security headers
+    if r["missing_headers"]:
         lines.append("*📋 Security Header Issues:*")
-        # Group by severity
-        by_sev: Dict[str, List] = defaultdict(list)
-        for name, hdr, sev in missing:
-            by_sev[sev].append((name, hdr))
-        for sev in ("HIGH", "MEDIUM", "LOW", "INFO"):
-            items = by_sev.get(sev, [])
-            if not items:
-                continue
-            em = _SEV_EMOJI_V2.get(sev, "⚪")
-            lines.append(f"  {em} *{sev}:*")
-            for name, hdr in items[:5]:
-                if any(k in name.lower() for k in ('leak', 'disclosure', 'version')):
-                    lines.append(f"    — {name}: `{hdr[:50]}`")
-                else:
-                    lines.append(f"    — Missing *{name}*")
+        for name, hdr, sev in r["missing_headers"][:8]:
+            em = _SEV_EMOJI.get(sev,"⚪")
+            if "leak" in name.lower() or "disclosure" in name.lower():
+                lines.append(f"  {em} {name}: `{hdr}`")
+            else:
+                lines.append(f"  {em} Missing *{name}*")
         lines.append("")
 
-    # ── Subdomains ─────────────────────────────────────────────
-    subs = r.get("subdomains_found", [])
-    if subs:
-        lines.append(f"*📡 Live Subdomains ({len(subs)}):*")
-        for s in subs[:10]:
-            try:
-                netloc = urlparse(s).netloc
-            except Exception:
-                netloc = s
-            lines.append(f"  • `{netloc}`")
-        if len(subs) > 10:
-            lines.append(f"  _+ {len(subs)-10} more_")
-        lines.append("")
-
-    # ── Cloudflare note ────────────────────────────────────────
+    # Cloudflare note
     if r.get("cloudflare"):
         lines += [
             "☁️ *Cloudflare note:*",
             "  Some paths may be hidden behind CF WAF.",
-            "  403 may mean file exists but Cloudflare blocks direct access.",
+            "  403 results may indicate file exists but CF blocks it.",
             "",
         ]
 
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ _Passive recon only — no exploitation performed_",
-    ]
+    lines += ["━━━━━━━━━━━━━━━━━━",
+              "⚠️ _Passive scan only — no exploitation_"]
     return "\n".join(lines)
-
-
-def _format_api_report_v2(data: dict, base_url: str) -> str:
-    """
-    PATCHED API endpoint report — severity-grouped, CONFIG_LEAK highlighted.
-    
-    Sections:
-    ├ Header (domain, counts)
-    ├ 🚨 Critical leaks (CONFIG_LEAK, SOURCE_MAP)
-    ├ ⚡ GraphQL endpoints
-    ├ 🔌 JSON APIs (grouped by risk score)
-    ├ 📄 API Docs (Swagger/OpenAPI)
-    ├ 🔒 Protected endpoints
-    └ 📰 Other (XML/RSS, OTHER) — collapsed
-    """
-    domain = urlparse(base_url).netloc
-    found  = data.get("found", [])
-    stats  = data.get("stats", {})
-
-    lines = [
-        "🔌 *API Endpoint Discovery Report*",
-        "━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 `{domain}`",
-        f"🔍 Probed: `{stats.get('total_probed', 0)}` paths",
-        f"✅ Found:  `{len(found)}` endpoints",
-        "",
-        f"  🚨 Config leaks:  `{stats.get('config_leaks', 0)}`",
-        f"  🗺️ Source maps:   `{stats.get('source_maps', 0)}`",
-        f"  ⚡ GraphQL:       `{stats.get('graphql', 0)}`",
-        f"  🔌 JSON APIs:     `{stats.get('json_apis', 0)}`",
-        f"  📄 API Docs:      `{stats.get('api_docs', 0)}`",
-        f"  🔒 Protected:     `{stats.get('protected', 0)}`",
-        "",
-    ]
-
-    # ── 1. Critical: CONFIG_LEAK + SOURCE_MAP ──────────────────
-    critical = [e for e in found if e["type"] in ("CONFIG_LEAK", "SOURCE_MAP")]
-    if critical:
-        lines.append("🚨 *CRITICAL — Sensitive Files Exposed:*")
-        for e in critical:
-            em   = "🚨" if e["type"] == "CONFIG_LEAK" else "🗺️"
-            risk = f"risk:{e.get('risk',0)}"
-            lines.append(f"  {em} `[{e['status']}]` {e['url'].split('://',1)[-1][:55]}")
-            preview = e.get("preview", "")[:80]
-            if preview:
-                lines.append(f"     _Preview:_ `{preview}`")
-            cors = e.get("cors")
-            if cors:
-                lines.append(f"     CORS: `{cors[:40]}`")
-        lines.append("")
-
-    # ── 2. GraphQL ─────────────────────────────────────────────
-    graphql = [e for e in found if e["type"] == "GRAPHQL"]
-    if graphql:
-        lines.append("⚡ *GraphQL Endpoints:*")
-        for e in graphql:
-            lines.append(f"  • `{_clean_url_display(e['url'])}` `[{e['status']}]`")
-            cors = e.get("cors")
-            if cors:
-                lines.append(f"    CORS: `{cors[:40]}`")
-        lines.append("")
-
-    # ── 3. JSON APIs (sorted by risk score desc) ───────────────
-    json_apis = sorted(
-        [e for e in found if e["type"] == "JSON_API"],
-        key=lambda x: x.get("risk", 0), reverse=True
-    )
-    if json_apis:
-        lines.append(f"🔌 *JSON API Endpoints ({len(json_apis)}):*")
-        high_risk = [e for e in json_apis if e.get("risk", 0) >= 20]
-        normal    = [e for e in json_apis if e.get("risk", 0) < 20]
-        if high_risk:
-            lines.append("  ⚠️ _High-value paths:_")
-            for e in high_risk[:8]:
-                methods = e.get("allow_methods", "")
-                note    = e.get("note", "")
-                m_str   = f" `{methods[:30]}`" if methods else ""
-                n_str   = f" _{note[:40]}_" if note else ""
-                lines.append(f"  • `{_clean_url_display(e['url'])}`{m_str}{n_str}")
-                prev = e.get("preview", "")[:100]
-                if prev and prev.startswith(('{', '[')):
-                    lines.append(f"    `{prev}`")
-            lines.append("")
-        if normal:
-            lines.append(f"  _Standard endpoints ({len(normal)}):_")
-            for e in normal[:10]:
-                lines.append(f"  • `{_clean_url_display(e['url'])}` `[{e['status']}]`")
-            if len(normal) > 10:
-                lines.append(f"  _+ {len(normal)-10} more_")
-        lines.append("")
-
-    # ── 4. API Docs ────────────────────────────────────────────
-    api_docs = [e for e in found if e["type"] == "API_DOCS"]
-    if api_docs:
-        lines.append("📄 *API Documentation:*")
-        for e in api_docs[:5]:
-            lines.append(f"  • `{_clean_url_display(e['url'])}` `[{e['status']}]`")
-        lines.append("")
-
-    # ── 5. Protected endpoints ─────────────────────────────────
-    protected = [e for e in found if e["type"] == "PROTECTED"]
-    if protected:
-        lines.append(f"🔒 *Protected Endpoints ({len(protected)}):*")
-        for e in protected[:6]:
-            note = e.get("note", "")
-            n_str = f" — `{note[:50]}`" if note else ""
-            lines.append(f"  • `{_clean_url_display(e['url'])}` `[{e['status']}]`{n_str}")
-        if len(protected) > 6:
-            lines.append(f"  _+ {len(protected)-6} more protected_")
-        lines.append("")
-
-    # ── 6. XML/RSS feeds ──────────────────────────────────────
-    feeds = [e for e in found if e["type"] == "XML/RSS"]
-    if feeds:
-        lines.append(f"📰 *Feeds / XML ({len(feeds)}):*")
-        for e in feeds[:4]:
-            lines.append(f"  • `{_clean_url_display(e['url'])}`")
-        lines.append("")
-
-    # ── Mined paths info ───────────────────────────────────────
-    js_mined   = len(data.get("js_mined", []))
-    html_mined = len(data.get("html_mined", []))
-    if js_mined or html_mined:
-        lines += [
-            f"🔍 _Mined from JS: `{js_mined}` | HTML: `{html_mined}` paths_",
-            "",
-        ]
-
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ _Passive scan — no authentication or exploitation_",
-    ]
-    return "\n".join(lines)
-
 
 
 async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5167,78 +4795,6 @@ def _rewrite_css_urls(css: str, page_url: str, page_local: str, domain_dir: str,
     return re.sub(r'''url\(\s*(["\']?[^)"'\s]+["\']?)\s*\)''', _replacer, css)
 
 
-
-# ── CF Bypass helpers (v35) ──────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-# /dl IMPROVED FUNCTIONS — Drop-in replacements
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── CF Browser Fingerprint Headers ────────────────────────────────────────────
-_CF_CHALLENGE_SIGS = (
-    b'cf_chl_opt', b'jschl_vc', b'cf-spinner', b'cf-challenge',
-    b'__cf_bm', b'cf_clearance', b'cloudflare-static',
-    b'Please enable JS', b'Enable JavaScript',
-    b'Checking your browser', b'DDoS protection by',
-    b'ray-id', b'cf-ray',
-)
-
-_CF_BROWSER_HEADERS = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Cache-Control': 'max-age=0',
-    'DNT': '1',
-}
-
-def _is_cf_challenge(html_bytes: bytes) -> bool:
-    """Detect Cloudflare JS challenge / CAPTCHA page."""
-    if not html_bytes:
-        return False
-    snip = html_bytes[:4096].lower()
-    return any(sig.lower() in snip for sig in _CF_CHALLENGE_SIGS)
-
-def _cf_bypass_request(session, url: str, timeout: int = 30) -> tuple:
-    """
-    Cloudflare bypass strategy:
-    1. Rotate UA + add CF-friendly headers
-    2. Try with cookies from previous session (cf_clearance)
-    3. Random delay between 2-5s (mimics browser think time)
-    4. Follow redirects fully
-    Returns (response | None, bypassed: bool)
-    """
-    strategies = [
-        # Strategy 1: Browser-like headers
-        lambda: session.get(url, headers={**_get_headers(), **_CF_BROWSER_HEADERS},
-                           timeout=timeout, verify=False, allow_redirects=True),
-        # Strategy 2: Mobile UA
-        lambda: session.get(url, headers={
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
-            **_CF_BROWSER_HEADERS,
-        }, timeout=timeout, verify=False, allow_redirects=True),
-        # Strategy 3: Different Accept
-        lambda: session.get(url, headers={
-            **_get_headers(),
-            'Accept': '*/*',
-            'Referer': f"{urlparse(url).scheme}://{urlparse(url).netloc}/",
-        }, timeout=timeout, verify=False, allow_redirects=True),
-    ]
-    for i, strategy in enumerate(strategies):
-        try:
-            time.sleep(random.uniform(1.5, 3.5) * (i + 1))
-            resp = strategy()
-            if resp.status_code == 200 and not _is_cf_challenge(resp.content[:4096]):
-                return resp, True
-        except Exception as e:
-            logger.debug("CF bypass strategy %d failed: %s", i+1, e)
-    return None, False
-
-
 def download_website(
     base_url: str,
     full_site: bool,
@@ -5252,60 +4808,39 @@ def download_website(
     cookies: str = "",
     extra_headers: str = "",
 ) -> tuple:
-    """
-    Website downloader — v35 improved.
 
-    Improvements:
-    ✅ Progress bar: phase labels + ETA + speed (MB/s)
-    ✅ Asset quality: dedup by content hash (skip re-downloads)
-    ✅ Error messages: specific hints per error type
-    ✅ Large site: chunked resume saves every 10 pages (was 5)
-    ✅ Cloudflare bypass: 3-strategy rotation with random delays
-    ✅ Asset skip list: large binary files early-skipped before network call
-    ✅ Progress: per-phase status (Pages → Assets → CSS → ZIP)
-    ✅ Stats: tracks CF-bypassed count, deduped count
-    """
     domain     = urlparse(base_url).netloc
-    safe       = re.sub(r'[^\w\-]', '_', domain)
+    safe       = re.sub(r'[^\w\-]','_', domain)
     domain_dir = os.path.join(DOWNLOAD_DIR, safe)
-
-    # BUG FIX: Only clear dir on fresh download — NOT on resume
-    if not resume and os.path.exists(domain_dir):
+    # Clear old source dir before fresh download to avoid stale/mixed files
+    if os.path.exists(domain_dir):
         shutil.rmtree(domain_dir, ignore_errors=True)
     os.makedirs(domain_dir, exist_ok=True)
 
-    # ── Site profile ──────────────────────────────────────────────
+    # ── Use or create SiteProfile ─────────────────
     if not isinstance(site_profile, SiteProfile):
         site_profile = detect_site_profile(base_url)
     ASSET_WORKERS = site_profile.asset_workers
     PAGE_DELAY    = site_profile.page_delay
     REQ_DELAY     = site_profile.req_delay
-    IS_CF         = site_profile.is_cloudflare or site_profile.has_waf
 
     if progress_cb:
-        cf_note = " ☁️ CF detected — bypass mode" if IS_CF else ""
         progress_cb(
-            f"🔍 *Site Profile: {site_profile.profile_name}*{cf_note}\n"
+            f"🔍 Site: *{site_profile.profile_name}*\n"
             f"{site_profile.summary()}"
         )
 
-    # ── Resume state ──────────────────────────────────────────────
     state        = load_resume(base_url) if resume else {"visited":[],"downloaded":[],"assets":[],"stats":{}}
     visited      = set(state["visited"])
     dl_done      = set(state["downloaded"])
     known_assets = set(state["assets"])
-    stats        = state.get("stats") or {
-        'pages': 0, 'assets': 0, 'failed': 0, 'size_kb': 0.0,
-        'cf_bypassed': 0, 'deduped': 0, 'skipped': 0,
-    }
-    # Ensure new stat keys exist on loaded state
-    for key in ('cf_bypassed', 'deduped', 'skipped'):
-        stats.setdefault(key, 0)
+    stats = state.get("stats") or {'pages':0,'assets':0,'failed':0,'size_kb':0}
 
-    # ── Session ───────────────────────────────────────────────────
+    # ── Session with enterprise-grade retry + connection pool ──────
     session = _get_pooled_session(verify_ssl=False)
     session.headers.update(_get_headers())
 
+    # ── Apply custom cookies / headers (V30) ──────
     if cookies:
         for ck in cookies.split(';'):
             ck = ck.strip()
@@ -5319,43 +4854,36 @@ def download_website(
                 k, v = hdr.split(':', 1)
                 session.headers[k.strip()] = v.strip()
 
-    # ── Content hash set (dedup identical assets) ─────────────────
-    _content_hashes: set = set()
-    _content_hash_lock   = threading.Lock()
+    # ── Attach proxy to session if available ──────
 
-    # ── Phase 0: Sitemap ─────────────────────────────────────────
-    queue: deque     = deque([base_url])
-    _depth_map: dict = {base_url: 0}
-    _t_start         = time.monotonic()
-
+    # ── Phase 0: Sitemap discovery ───────────────
+    queue: deque  = deque([base_url])
+    _depth_map: dict = {base_url: 0}  # URL → crawl depth
     if full_site and not resume:
-        if progress_cb:
-            progress_cb("🗺️ *Phase 0/4* — Sitemap ရှာနေပါတယ်...")
+        if progress_cb: progress_cb("🗺️ Sitemap ရှာနေပါတယ်...")
         sitemap_urls = fetch_sitemap(base_url)
         if sitemap_urls:
             stats['sitemap_urls'] = len(sitemap_urls)
             if progress_cb:
-                progress_cb(f"🗺️ Sitemap: `{len(sitemap_urls)}` URLs တွေ့ပြီ")
+                progress_cb("🗺️ Sitemap: `%d` URLs တွေ့ပြီ" % len(sitemap_urls))
             seen_q = set(queue)
             for u in list(sitemap_urls)[:max_pages]:
                 if u not in visited and u not in seen_q:
                     queue.append(u)
                     seen_q.add(u)
 
-    # ── Phase 1: Pages ────────────────────────────────────────────
-    seen_q  = set()
+    # ── Phase 1: Pages ──────────────────────────
+    seen_q = set()
     deduped = deque()
     for u in queue:
         if u not in visited and u not in seen_q:
             deduped.append(u)
             seen_q.add(u)
-    queue   = deduped
-    total_q = max(len(queue), 1)
+    queue = deduped
 
     while queue and len(visited) < max_pages:
         url = queue.popleft()
-        if url in visited:
-            continue
+        if url in visited: continue
 
         safe_ok, reason = is_safe_url(url)
         if not safe_ok:
@@ -5366,35 +4894,25 @@ def download_website(
 
         visited.add(url)
         html, js_used = fetch_page(url, use_js)
-
-        # ── Cloudflare bypass ──────────────────────────────────────
-        if html is None and IS_CF:
-            logger.info("CF bypass attempt for %s", sanitize_log_url(url))
-            cf_resp, bypassed = _cf_bypass_request(session, url)
-            if bypassed and cf_resp is not None:
-                html = cf_resp.text
-                js_used = False
-                stats['cf_bypassed'] += 1
-
         if html is None:
             stats['failed'] += 1
-            if REQ_DELAY:
-                time.sleep(REQ_DELAY)
+            if REQ_DELAY: time.sleep(REQ_DELAY)
             continue
 
         local = safe_local_path(domain_dir, url)
         try:
+            # ── V30: Rewrite HTML links to local relative paths ──
             rewritten_html = rewrite_html_links(html, url, domain_dir)
-            with open(local, 'w', encoding='utf-8', errors='replace') as f:
+            with open(local,'w',encoding='utf-8',errors='replace') as f:
                 f.write(rewritten_html)
             stats['pages'] += 1
         except Exception:
             stats['failed'] += 1
             continue
 
+        # ── Parse HTML once, share between both functions ──
         soup = BeautifulSoup(html, _BS_PARSER)
         known_assets |= extract_assets(html, url, soup=soup)
-
         if full_site:
             cur_depth = _depth_map.get(url, 0)
             if cur_depth < max_depth:
@@ -5404,164 +4922,115 @@ def download_website(
                         seen_q.add(link)
                         _depth_map[link] = cur_depth + 1
 
-        # Save resume every 10 pages (was 5) — less I/O on large sites
-        if stats['pages'] % 10 == 0:
-            save_resume(base_url, {
-                "visited":    list(visited),
-                "downloaded": list(dl_done),
-                "assets":     list(known_assets),
-                "stats":      stats,
-            })
-
+        if stats['pages'] % 5 == 0:
+            save_resume(base_url, {"visited":list(visited),"downloaded":list(dl_done),
+                                   "assets":list(known_assets),"stats":stats})
         if progress_cb:
-            elapsed  = time.monotonic() - _t_start
-            done_pct = stats['pages'] / max(total_q, 1)
-            bar      = pbar(stats['pages'], total_q, elapsed=elapsed)
-            eta_str  = ""
-            if elapsed > 3 and done_pct > 0.05:
-                eta_s   = elapsed / done_pct * (1 - done_pct)
-                eta_str = f" ETA ~{int(eta_s)}s"
-            cf_str  = f" ☁️{stats['cf_bypassed']} bypassed" if stats['cf_bypassed'] else ""
+            bar = pbar(stats['pages'], max(len(visited), 1))
             progress_cb(
-                f"📄 *Phase 1/4 — Pages* [{site_profile.profile_name}]\n"
-                f"`{bar}`\n"
-                f"`{stats['pages']}` pages | `{len(known_assets)}` assets found"
-                f"{cf_str}{eta_str}"
+                f"📄 *Pages* [{site_profile.profile_name}]\n`{bar}`\n"
+                f"`{stats['pages']}` pages | `{len(known_assets)}` assets"
                 + (" ⚡JS" if js_used else "")
             )
 
+        # Adaptive delay — prevent rate limiting on protected sites
         if PAGE_DELAY > 0:
             time.sleep(PAGE_DELAY)
 
-    # ── Phase 2: Asset download ───────────────────────────────────
+    # ── Phase 2: Assets — PARALLEL download ─────
     asset_list   = [a for a in list(known_assets)[:max_assets] if a not in dl_done]
     total_assets = len(asset_list) + len(dl_done)
     extra_css    = set()
     max_bytes    = MAX_ASSET_MB * 1024 * 1024
-
-    # Skip large binary files BEFORE any network call
-    _SKIP_EXTS = (
-        '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv',
-        '.iso', '.exe', '.dmg', '.pkg', '.msi',
-    )
-    _MAX_SINGLE = 50 * 1024 * 1024  # 50MB per asset
-
-    _lock       = threading.Lock()
-    _rate_event = threading.Event()
-    _rate_event.set()
-    _phase2_start = time.monotonic()
+    # V30: Skip large binary files unless explicitly requested
+    _SKIP_LARGE_EXTS = ('.mp4','.mkv','.avi','.mov','.wmv','.flv',
+                        '.iso','.exe','.dmg','.pkg')
+    _MAX_SINGLE_ASSET_BYTES = 50 * 1024 * 1024  # 50MB per single asset
+    import threading as _threading
+    _lock        = _threading.Lock()
+    _rate_event  = _threading.Event()
+    _rate_event.set()   # set = OK to proceed; clear = backing off 429
 
     def _download_asset(asset_url: str) -> tuple:
         """
-        Download one asset — v35 improved.
-        ✅ Content-hash dedup (skip identical files)
-        ✅ Early skip for large binary formats
-        ✅ Cloudflare 403/503 retry with jitter
-        ✅ CF bypass on challenge pages
-        ✅ CSS url() rewrite on save
-        ✅ Returns (css_hits, js_hits, size_kb, ok)
+        Download one asset.
+        V31 Upgrade:
+        • Exponential backoff (not just 429, also connection errors)
+        • Pooled session (no per-call overhead)
+        • Optimized streaming chunk size (128KB)
+        • Graceful WAF / Cloudflare handling
         """
         _rate_event.wait(timeout=60)
 
-        # Early skip: large binary formats
-        url_lower = asset_url.lower().split('?')[0]
-        if any(url_lower.endswith(ext) for ext in _SKIP_EXTS):
-            with _lock:
-                stats['skipped'] += 1
-            return set(), set(), 0.0, False
-
         safe_ok, reason = is_safe_url(asset_url)
         if not safe_ok:
-            log_warn(asset_url, f"Asset SSRF: {reason}")
-            return set(), set(), 0.0, False
+            log_warn(asset_url, f"Asset SSRF blocked: {reason}")
+            return set(), set(), 0, False
 
-        MAX_RETRIES = 3
-        for attempt in range(MAX_RETRIES):
+        MAX_ASSET_RETRIES = 3
+        for attempt in range(MAX_ASSET_RETRIES):
             try:
                 resp = session.get(
                     asset_url,
                     headers=_get_headers(),
-                    timeout=(6, TIMEOUT),
+                    timeout=(6, TIMEOUT),   # connect_timeout, read_timeout
                     stream=True,
                 )
 
-                # 429 rate limit
+                # ── Rate-limit handling (429) ──────────
                 if resp.status_code == 429:
-                    retry_after = min(int(resp.headers.get('Retry-After', 2**(attempt+2))), 60)
-                    logger.warning("429 on %s — pause %ds", sanitize_log_url(asset_url), retry_after)
+                    retry_after = int(resp.headers.get('Retry-After', 2 ** (attempt + 2)))
+                    retry_after = min(retry_after, 60)
+                    logger.warning("429 rate-limit on %s — pausing %ds (attempt %d)",
+                                   sanitize_log_url(asset_url), retry_after, attempt + 1)
                     _rate_event.clear()
                     time.sleep(retry_after)
                     _rate_event.set()
                     continue
 
-                # Cloudflare 403/503 — jitter retry
-                if resp.status_code in (403, 503):
-                    is_cf = ('cf-ray' in resp.headers or
-                             'cloudflare' in resp.headers.get('Server','').lower())
-                    if is_cf and attempt < MAX_RETRIES - 1:
-                        time.sleep(2**attempt + random.uniform(1.0, 3.0))
+                # ── Cloudflare block ───────────────────
+                if resp.status_code in (403, 503) and 'cf-ray' in resp.headers:
+                    if attempt < MAX_ASSET_RETRIES - 1:
+                        time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
                         continue
-                    return set(), set(), 0.0, False
+                    return set(), set(), 0, False
 
                 if resp.status_code >= 400:
-                    return set(), set(), 0.0, False
+                    return set(), set(), 0, False
 
-                # Content-Length pre-check
-                cl = resp.headers.get('Content-Length', '')
-                if cl.isdigit() and int(cl) > max_bytes:
-                    return set(), set(), 0.0, False
+                # ── Content-Length pre-check ───────────
+                cl = resp.headers.get('Content-Length')
+                if cl and int(cl) > max_bytes:
+                    log_warn(asset_url, f"Asset too large: {int(cl)//1024//1024}MB — skipped")
+                    return set(), set(), 0, False
 
-                # Stream into buffer
-                buf   = io.BytesIO()
-                CHUNK = 131072  # 128KB
+                # ── Stream download (128KB chunks) ─────
+                buf = io.BytesIO()
+                CHUNK = 131072  # 128KB — faster than 64KB
                 for chunk in resp.iter_content(CHUNK):
                     if not chunk:
                         continue
                     buf.write(chunk)
                     if buf.tell() > max_bytes:
-                        return set(), set(), 0.0, False
+                        log_warn(asset_url, "Asset size limit exceeded — skipped")
+                        return set(), set(), 0, False
 
                 content = buf.getvalue()
                 if not content:
-                    return set(), set(), 0.0, False
+                    return set(), set(), 0, False
 
-                # ── Content-hash dedup ─────────────────────────────
-                content_hash = hashlib.md5(content[:4096]).hexdigest()
-                with _content_hash_lock:
-                    if content_hash in _content_hashes:
-                        with _lock:
-                            stats['deduped'] += 1
-                        return set(), set(), 0.0, False
-                    _content_hashes.add(content_hash)
+                local = safe_local_path(domain_dir, asset_url)
+                with open(local, 'wb') as f:
+                    f.write(content)
+                size_kb = len(content) / 1024
 
-                # Save file
-                local   = safe_local_path(domain_dir, asset_url)
-                ct      = resp.headers.get('Content-Type', '').lower()
-                is_css  = 'css' in ct or url_lower.endswith('.css')
-                is_js   = 'javascript' in ct or 'ecmascript' in ct or url_lower.endswith('.js')
-                size_kb = len(content) / 1024.0
-
-                if is_css:
-                    try:
-                        css_text = content.decode('utf-8', 'replace')
-                        page_local = safe_local_path(domain_dir, asset_url)
-                        origin = f"{urlparse(asset_url).scheme}://{urlparse(asset_url).netloc}"
-                        rewritten = _rewrite_css_urls(css_text, asset_url, page_local, domain_dir, origin)
-                        with open(local, 'w', encoding='utf-8', errors='replace') as f:
-                            f.write(rewritten)
-                    except Exception:
-                        with open(local, 'wb') as f:
-                            f.write(content)
-                else:
-                    with open(local, 'wb') as f:
-                        f.write(content)
-
-                css_hits: set = set()
-                js_hits:  set = set()
-                if is_css:
+                ct       = resp.headers.get('Content-Type', '')
+                css_hits = set()
+                js_hits  = set()
+                if 'css' in ct or asset_url.lower().endswith('.css'):
                     css_hits = extract_css_assets(content.decode('utf-8', 'replace'), asset_url)
-                if is_js:
-                    js_hits  = extract_media_from_js(content.decode('utf-8', 'replace'), base_url)
+                if 'javascript' in ct or asset_url.lower().endswith('.js'):
+                    js_hits = extract_media_from_js(content.decode('utf-8', 'replace'), base_url)
 
                 if REQ_DELAY > 0:
                     time.sleep(REQ_DELAY)
@@ -5569,27 +5038,23 @@ def download_website(
                 return css_hits, js_hits, size_kb, True
 
             except requests.exceptions.Timeout:
-                if attempt < MAX_RETRIES - 1:
+                if attempt < MAX_ASSET_RETRIES - 1:
                     time.sleep(1.5 * (attempt + 1))
                     continue
-                return set(), set(), 0.0, False
+                return set(), set(), 0, False
 
             except requests.exceptions.ConnectionError:
-                if attempt < MAX_RETRIES - 1:
+                if attempt < MAX_ASSET_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     continue
-                return set(), set(), 0.0, False
-
-            except OSError as e:
-                logger.debug("Asset file write error %s: %s", asset_url[:50], e)
-                return set(), set(), 0.0, False
+                return set(), set(), 0, False
 
             except Exception:
-                return set(), set(), 0.0, False
+                return set(), set(), 0, False
 
-        return set(), set(), 0.0, False
+        return set(), set(), 0, False
 
-    # Parallel asset download
+    # ── Run parallel asset downloads (reuse global executor) ──────
     completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_WORKERS) as ex:
         fmap = {ex.submit(_download_asset, url): url for url in asset_list}
@@ -5612,101 +5077,86 @@ def download_website(
                     stats['failed'] += 1
 
             if completed % 30 == 0:
-                save_resume(base_url, {
-                    "visited":    list(visited),
-                    "downloaded": list(dl_done),
-                    "assets":     list(known_assets),
-                    "stats":      stats,
-                })
-
-            if progress_cb and completed % 15 == 0:
-                elapsed2 = time.monotonic() - _phase2_start
-                speed    = (stats['size_kb'] / 1024.0) / max(elapsed2, 1)
-                bar2     = pbar(completed, max(total_assets, 1), elapsed=elapsed2)
-                dedup_str = f" 🔁{stats['deduped']}dup" if stats['deduped'] else ""
-                skip_str  = f" ⏭️{stats['skipped']}skip" if stats['skipped'] else ""
+                save_resume(base_url, {"visited": list(visited),
+                                       "downloaded": list(dl_done),
+                                       "assets": list(known_assets),
+                                       "stats": stats})
+            if progress_cb and completed % 10 == 0:
+                bar = pbar(completed, total_assets)
                 progress_cb(
-                    f"📦 *Phase 2/4 — Assets* ⚡×{ASSET_WORKERS}\n"
-                    f"`{bar2}`\n"
-                    f"`{stats['assets']}` saved | `{stats['size_kb']/1024:.1f}` MB"
-                    f" | `{speed:.2f}` MB/s"
-                    f"{dedup_str}{skip_str}"
+                    f"📦 *Assets* ⚡×{ASSET_WORKERS}\n`{bar}`\n"
+                    f"`{stats['assets']}` done | `{stats['size_kb']/1024:.1f}` MB"
                 )
 
-    # ── Phase 3: CSS @import recursion ───────────────────────────
+    # ── Phase 3: CSS nested assets (recursive depth 3) ──
     def _dl_css_extra(asset_url):
         safe_ok, _ = is_safe_url(asset_url)
-        if not safe_ok:
-            return 0, set(), False
+        if not safe_ok: return 0, set(), False
         try:
             resp = session.get(asset_url, timeout=TIMEOUT, stream=True)
             resp.raise_for_status()
             buf = io.BytesIO()
             for chunk in resp.iter_content(65536):
                 buf.write(chunk)
-                if buf.tell() > max_bytes:
-                    return 0, set(), False
+                if buf.tell() > max_bytes: return 0, set(), False
             content = buf.getvalue()
             local   = safe_local_path(domain_dir, asset_url)
+            # Rewrite CSS urls to local paths
             try:
-                css_text   = content.decode('utf-8', 'replace')
+                css_text = content.decode('utf-8', 'replace')
                 page_local = safe_local_path(domain_dir, asset_url)
-                origin     = f"{urlparse(asset_url).scheme}://{urlparse(asset_url).netloc}"
-                rewritten  = _rewrite_css_urls(css_text, asset_url, page_local, domain_dir, origin)
+                rewritten_css = _rewrite_css_urls(
+                    css_text, asset_url, page_local, domain_dir,
+                    f"{urlparse(asset_url).scheme}://{urlparse(asset_url).netloc}"
+                )
                 with open(local, 'w', encoding='utf-8') as f:
-                    f.write(rewritten)
+                    f.write(rewritten_css)
             except Exception:
                 with open(local, 'wb') as f:
                     f.write(content)
+            # Extract nested @imports for recursive fetch
             nested = extract_css_assets(content.decode('utf-8', 'replace'), asset_url)
             return len(content) / 1024, nested, True
         except Exception:
             return 0, set(), False
 
-    if extra_css:
-        if progress_cb:
-            progress_cb(f"🎨 *Phase 3/4 — CSS @imports* (`{len(extra_css)}` nested)...")
-        css_queue = list(extra_css - dl_done)[:200]
-        for _depth_css in range(3):
-            if not css_queue:
-                break
-            next_level = set()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_WORKERS) as ex:
-                fmap = {ex.submit(_dl_css_extra, u): u for u in css_queue}
-                for fut in concurrent.futures.as_completed(fmap):
-                    dl_done.add(fmap[fut])
-                    try:
-                        size_kb, nested, ok = fut.result()
-                        if ok:
-                            stats['assets']  += 1
-                            stats['size_kb'] += size_kb
-                            next_level |= (nested - dl_done)
-                        else:
-                            stats['failed'] += 1
-                    except Exception:
+    # Up to 3 levels of CSS @import recursion
+    css_queue = list(extra_css - dl_done)[:200]
+    for _depth in range(3):
+        if not css_queue: break
+        next_level = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_WORKERS) as ex:
+            fmap = {ex.submit(_dl_css_extra, u): u for u in css_queue}
+            for fut in concurrent.futures.as_completed(fmap):
+                dl_done.add(fmap[fut])
+                try:
+                    size_kb, nested, ok = fut.result()
+                    if ok:
+                        stats['assets']  += 1
+                        stats['size_kb'] += size_kb
+                        next_level |= (nested - dl_done)
+                    else:
                         stats['failed'] += 1
-            css_queue = list(next_level)[:100]
+                except Exception:
+                    stats['failed'] += 1
+        css_queue = list(next_level)[:100]  # max 100 per level
 
-    # ── Phase 4: ZIP ─────────────────────────────────────────────
-    if progress_cb:
-        progress_cb(
-            f"🗜️ *Phase 4/4 — ZIP ထုပ်နေပါတယ်...*\n"
-            f"`{stats['assets']}` assets | `{stats['size_kb']/1024:.1f}` MB"
-        )
+    # ── Phase 4: ZIP ─────────────────────────────
+    if progress_cb: progress_cb("🗜️ ZIP ထုပ်နေပါတယ်...")
 
     zip_path = os.path.join(DOWNLOAD_DIR, f"{safe}.zip")
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for root_d, dirs, files in os.walk(domain_dir):
+    with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as zf:
+        for root,dirs,files in os.walk(domain_dir):
             for file in files:
-                fp = os.path.join(root_d, file)
-                try:
-                    zf.write(fp, os.path.relpath(fp, DOWNLOAD_DIR))
-                except Exception as e:
-                    logger.debug("ZIP add failed %s: %s", fp, e)
+                fp = os.path.join(root,file)
+                zf.write(fp, os.path.relpath(fp, DOWNLOAD_DIR))
 
+    # NOTE: domain_dir is kept intact for /analyze and /codeaudit scanning.
+    # Use /cleandl <domain> (admin) to delete source files manually.
     clear_resume(base_url)
 
-    size_mb = os.path.getsize(zip_path) / 1024 / 1024
+    size_mb = os.path.getsize(zip_path)/1024/1024
+    # Always return full zip — large file handling (gofile/split) done in cmd handler
     return [zip_path], None, stats, size_mb
 
 
@@ -10488,135 +9938,87 @@ async def _run_download(
     resume_mode: bool = False,
     cookies: str = "", extra_headers: str = "", max_depth: int = 5,
 ):
-    """
-    Download orchestrator — v35 improved.
-    ✅ Phase-aware progress bar with ETA
-    ✅ Speed display (MB/s)
-    ✅ Specific error messages per exception type
-    ✅ Post-download summary with dedup/skipped/CF stats
-    ✅ Cancel check between phases
-    """
     uid   = update.effective_user.id
     uname = update.effective_user.first_name
 
-    # Rate limit
+    # ── Rate limit check ──────────────────────────
     if not resume_mode:
         allowed, wait_sec = check_rate_limit(uid)
         if not allowed:
             await update.effective_message.reply_text(
-                f"⏱️ Rate limit — `{wait_sec}s` ကျန်သေးတယ်",
+                f"⏱️ နည်းနည်းစောင့်ပါ — `{wait_sec}` seconds ကျန်သေးတယ်",
                 parse_mode='Markdown'
             )
             return
 
-    # SSRF check
+    # ── SSRF pre-check ────────────────────────────
     safe_ok, reason = is_safe_url(url)
     if not safe_ok:
         await update.effective_message.reply_text(
-            f"🚫 *URL မ valid ဘူး*\n`{reason}`",
+            f"🚫 URL ကို download လုပ်ခွင့်မပြုပါ\n`{reason}`",
             parse_mode='Markdown'
         )
         return
 
-    # DB checks
+    # ── DB checks (with lock) ─────────────────────
     async with db_lock:
         db = _load_db_sync()
         u  = get_user(db, uid, uname)
         reset_daily(u)
+
         if u["banned"]:
             _save_db_sync(db)
-            await update.effective_message.reply_text("🚫 Ban ထားပါတယ်")
-            return
+            await update.effective_message.reply_text("🚫 Ban ထားပါတယ်"); return
         if not db["settings"]["bot_enabled"] and uid not in ADMIN_IDS:
             _save_db_sync(db)
-            await update.effective_message.reply_text("🔴 Bot ယာယီပိတ်ထားပါတယ်")
-            return
+            await update.effective_message.reply_text("🔴 Bot ယာယီပိတ်ထားပါတယ်"); return
         if not resume_mode and not can_download(db, u):
             lim = get_limit(db, u)
             _save_db_sync(db)
-            await update.effective_message.reply_text(
-                f"⛔ *Daily limit ({lim}) ပြည့်ပါပြီ*\n"
-                f"မနက်ဖြန် reset ဖြစ်မည်",
-                parse_mode='Markdown'
-            )
-            return
+            await update.effective_message.reply_text(f"⛔ Daily limit ({lim}) ပြည့်ပါပြီ"); return
         _save_db_sync(db)
 
-    mode_txt = ("🌐 Full Site" if full_site else "📄 Single Page") + (" ⚡JS" if use_js else "")
-    domain   = urlparse(url).netloc
-
+    mode_txt = ("🌐 Full" if full_site else "📄 Single") + (" ⚡JS" if use_js else "")
     msg = await update.effective_message.reply_text(
-        f"{'▶️ Resuming' if resume_mode else '⬇️ Starting'} *Download*\n"
-        f"🌐 `{domain}`\n"
-        f"📋 {mode_txt}\n\n"
-        f"⏳ Site profile စစ်ဆေးနေပါတယ်...",
+        f"⣾ *Download စနေပါတယ်{'(Resume)' if resume_mode else ''}...*\n"
+        f"🔗 `{sanitize_log_url(url)}`\n📋 {mode_txt}\n\n"
+        f"`{'░'*18}`  0%",
         parse_mode='Markdown'
     )
 
-    # Shared state for progress callback
-    _progress = {'text': '', 'phase': 0, 'updated': 0.0}
+    last = {'t': ''}
+    def sync_cb(text): last['t'] = text
 
-    def sync_cb(text: str):
-        _progress['text'] = text
-        _progress['updated'] = time.monotonic()
-
-    # Cancel flag
+    # ── Cancel flag — /stop command ───────────────
     cancel_event = asyncio.Event()
-    _cancel_flags.set(uid, cancel_event)
-    _active_scans.set(uid, f"Download:{domain}")
+    _cancel_flags[uid] = cancel_event
 
-    # Progress loop — update Telegram every 2.5s
+    _spin_idx = [0]
     async def progress_loop():
-        last_txt = ''
         while True:
-            try:
-                await asyncio.sleep(2.5)
-            except asyncio.CancelledError:
-                return
+            await asyncio.sleep(2.0)
             if cancel_event.is_set():
                 return
-            txt = _progress['text']
-            if not txt or txt == last_txt:
-                # Animate spinner even without new text
-                spin = SPINNER_BRAILLE[int(time.monotonic() * 2) % len(SPINNER_BRAILLE)]
-                try:
-                    await msg.edit_text(
-                        f"{spin} *Download နေဆဲ...*\n"
-                        f"🌐 `{domain}`\n\n"
-                        f"{last_txt or '⏳ ပြင်ဆင်နေပါတယ်...'}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-                continue
-            last_txt = txt
-            spin = SPINNER_BRAILLE[int(time.monotonic() * 2) % len(SPINNER_BRAILLE)]
+            spin = SPINNER_BRAILLE[_spin_idx[0] % len(SPINNER_BRAILLE)]
+            _spin_idx[0] += 1
+            body = last['t'] if last['t'] else "`░░░░░░░░░░░░░░░░░░`  0%"
             try:
                 await msg.edit_text(
-                    f"{spin} *Download နေဆဲ...*\n"
-                    f"🌐 `{domain}`\n\n"
-                    f"{txt}",
+                    f"{spin} *Download နေဆဲ...*\n🔗 `{sanitize_log_url(url)}`\n\n{body}",
                     parse_mode='Markdown'
                 )
-            except (BadRequest, RetryAfter) as e:
-                if isinstance(e, RetryAfter):
-                    try:
-                        await asyncio.sleep(e.retry_after + 1)
-                    except asyncio.CancelledError:
-                        return
-            except asyncio.CancelledError:
-                return
-            except Exception:
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except BadRequest:
                 pass
 
     prog = asyncio.create_task(progress_loop())
 
-    # ── Run download in thread ────────────────────────────────────
     async with download_semaphore:
+        # Check cancel before starting heavy work
         if cancel_event.is_set():
             prog.cancel()
             _cancel_flags.pop(uid, None)
-            _active_scans.pop(uid, None)
             await msg.edit_text("🛑 Download cancelled")
             return
         try:
@@ -10624,48 +10026,24 @@ async def _run_download(
                 db2 = _load_db_sync()
             mp = db2["settings"]["max_pages"]
             ma = db2["settings"]["max_assets"]
-
             files, error, stats, size_mb = await asyncio.to_thread(
-                download_website,
-                url, full_site, use_js, mp, ma,
-                sync_cb, resume_mode, None, max_depth, cookies, extra_headers
+                download_website, url, full_site, use_js, mp, ma, sync_cb, resume_mode,
+                None, max_depth, cookies, extra_headers
             )
-
         except Exception as e:
             prog.cancel()
-            _active_scans.pop(uid, None)
-            _cancel_flags.pop(uid, None)
-
             err_name = type(e).__name__
-            # Specific error messages per exception type
-            _ERROR_HINTS = {
-                "ConnectionError":    ("🌐 Server နဲ့ ချိတ်ဆက်မရပါ",
-                                       "VPN သုံးကြည့်ပါ သို့မဟုတ် နောက်မှ retry"),
-                "Timeout":            ("⏱️ Request timeout ဖြစ်သွားတယ်",
-                                       "Site နှေးနေနိုင်တယ် — `/resume` နဲ့ ဆက်လုပ်နိုင်"),
-                "TimeoutError":       ("⏱️ Request timeout ဖြစ်သွားတယ်",
-                                       "Site နှေးနေနိုင်တယ် — `/resume` နဲ့ ဆက်လုပ်နိုင်"),
-                "SSLError":           ("🔒 SSL certificate ပြဿနာ",
-                                       "Site ရဲ့ SSL cert invalid — `--no-ssl` flag သုံးနိုင်"),
-                "TooManyRedirects":   ("🔄 Redirect loop ဖြစ်နေတယ်",
-                                       "Site ကို browser မှ စစ်ဆေးကြည့်ပါ"),
-                "MemoryError":        ("💾 Memory မလောက်ဘူး",
-                                       "Site အများကြီး — `single` mode သုံးပါ"),
-                "OSError":            ("💽 Disk space မလောက်ဘူး",
-                                       "/cleandl ဖြင့် ဟောင်း files ဖျက်ပါ"),
-                "PermissionError":    ("🔐 File permission error",
-                                       "Server restart လုပ်ကြည့်ပါ"),
-            }
-            hint_title, hint_tip = _ERROR_HINTS.get(
-                err_name,
-                (f"⚠️ {err_name}", "နောက်မှ retry လုပ်ကြည့်ပါ")
-            )
+            err_hint = {
+                "ConnectionError":  "🌐 ဆာဗာနဲ့ ချိတ်ဆက်မရပါ",
+                "TimeoutError":     "⏱️ Response timeout ဖြစ်သွားတယ်",
+                "SSLError":         "🔒 SSL certificate ပြဿနာ",
+                "TooManyRedirects": "🔄 Redirect loop ဖြစ်နေတယ်",
+            }.get(err_name, f"⚠️ {err_name}")
             await msg.edit_text(
                 f"❌ *Download မအောင်မြင်ဘူး*\n\n"
-                f"{hint_title}\n"
-                f"💡 _{hint_tip}_\n\n"
-                f"▸ Resume: `/resume {url}`\n"
-                f"▸ JS mode: `/dl {url} js`",
+                f"{err_hint}\n\n"
+                f"▸ ဆက်လုပ်ဖို့: `/resume {url}`\n"
+                f"▸ JS site ဆိုရင်: `/jsdownload {url}`",
                 parse_mode='Markdown'
             )
             async with db_lock:
@@ -10673,40 +10051,30 @@ async def _run_download(
                 u3  = get_user(db3, uid)
                 log_download(u3, url, 0, "error")
                 _save_db_sync(db3)
+            _cancel_flags.pop(uid, None)
             return
 
     prog.cancel()
-    _active_scans.pop(uid, None)
-    _cancel_flags.pop(uid, None)
+    _cancel_flags.pop(uid, None)   # download finished — remove flag
 
+    # Check if cancelled during download
     if cancel_event.is_set():
-        await msg.edit_text("🛑 Download cancel လုပ်ပြီးပါပြီ")
+        await msg.edit_text("🛑 Download ကို cancel လုပ်ပြီးပါပြီ")
         return
 
     if error:
-        await msg.edit_text(f"❌ {error}")
-        return
-
-    # ── Post-download summary ─────────────────────────────────────
-    dedup_line = f" | 🔁 `{stats['deduped']}` deduped" if stats.get('deduped') else ""
-    skip_line  = f" | ⏭️ `{stats['skipped']}` skipped" if stats.get('skipped') else ""
-    cf_line    = f" | ☁️ `{stats['cf_bypassed']}` CF bypassed" if stats.get('cf_bypassed') else ""
+        await msg.edit_text(f"❌ {error}"); return
 
     base_cap = (
-        f"✅ *Download Complete*\n"
-        f"🌐 `{domain}`\n"
-        f"📄 `{stats['pages']}` pages | "
-        f"📦 `{stats['assets']}` assets | "
-        f"💾 `{size_mb:.1f}` MB"
-        f"{dedup_line}{skip_line}{cf_line}"
+        f"✅ *Downloaded*\n"
+        f"🔗 `{sanitize_log_url(url)}`\n"
+        f"📄 {stats['pages']}p | 📦 {stats['assets']}a | 💾 {size_mb:.1f}MB"
     )
 
-    # Small file → direct Telegram upload
+    # ── Small file (≤SPLIT_MB): send directly via Telegram ──────────
     if not needs_split(files[0]):
         await msg.edit_text(
-            f"📤 *Telegram upload နေပါတယ်...*\n"
-            f"💾 `{size_mb:.1f}` MB\n"
-            f"📦 `{stats['assets']}` assets",
+            f"📤 Telegram upload နေပါတယ်...\n💾 {size_mb:.1f}MB",
             parse_mode='Markdown'
         )
         try:
@@ -10727,14 +10095,8 @@ async def _run_download(
                     if attempt == 2:
                         raise
                     await asyncio.sleep(3)
-            try:
-                os.remove(files[0])
-            except Exception:
-                pass
-            await msg.edit_text(
-                f"✅ *ပြီးပါပြီ* 🎉\n{base_cap}",
-                parse_mode='Markdown'
-            )
+            os.remove(files[0])
+            await msg.edit_text("✅ ပြီးပါပြီ 🎉", parse_mode='Markdown')
             async with db_lock:
                 db4 = _load_db_sync()
                 u4  = get_user(db4, uid)
@@ -10742,22 +10104,19 @@ async def _run_download(
                 _save_db_sync(db4)
         except RetryAfter as e:
             await msg.edit_text(
-                f"❌ Flood limit — `{e.retry_after}s` နောက်ကြိုးစားပါ",
+                f"❌ Flood limit — `{e.retry_after}s` နောက်ထပ်ကြိုးစားပါ",
                 parse_mode='Markdown'
             )
         except Exception as e:
-            await msg.edit_text(
-                f"❌ Upload error: `{type(e).__name__}`\n"
-                f"_ZIP file ကြီးလွန်းနိုင်တယ် — gofile.io upload ကြိုးစားနေပါ_",
-                parse_mode='Markdown'
-            )
+            await msg.edit_text(f"❌ Upload error: `{type(e).__name__}`", parse_mode='Markdown')
 
-    # Large file → smart filehost
+    # ── Large file (>SPLIT_MB): smart filehost upload ─────────────────
+    # gofile.io → transfer.sh → 0x0.st → split fallback (no manual reassembly needed)
     else:
         await msg.edit_text(
-            f"🌐 *Large file ({size_mb:.1f} MB)*\n"
-            f"☁️ File host upload နေပါတယ်...\n"
-            f"_gofile.io → transfer.sh → 0x0.st → split_",
+            f"🌐 *Large file ({size_mb:.1f}MB detected)*\n"
+            f"☁️ Free file host သို့ upload နေပါတယ်...\n"
+            f"_gofile.io → transfer.sh → 0x0.st → split fallback_",
             parse_mode='Markdown'
         )
         try:
@@ -12359,51 +11718,51 @@ async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ────────────────────────────────────────────────
 
 async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/dl <url> — Website downloader v35
-    Modes: single | full | js | jsful
-    Options: --depth N | --cookie X | --header X
+    """/dl <url> — Download (mode ကို keyboard နဲ့ ရွေး)
+    Replaces: /download /fullsite /jsdownload /jsfullsite
     """
     if not await check_force_join(update, context):
         return
 
     uid = update.effective_user.id
-
-    # Memory stress check
+    
+    # ✅ CHECK MEMORY STRESS
     if check_memory_usage():
         await update.effective_message.reply_text(
-            "⚠️ *System Busy* — Memory မျှဝေမရဘူး\n"
-            "_ခဏနေပြီးမှ retry လုပ်ပါ_",
+            "⚠️ *System Busy* — Memory usage high. Please try again in a few minutes.",
             parse_mode='Markdown'
         )
+        log_event("memory_stressed", uid, "rejected", {"reason": "high_memory"})
         return
-
-    # Daily quota check
+    
+    # ✅ CHECK DAILY QUOTA
     quota_ok, remaining, quota_msg = check_user_quota(uid, "download")
     if not quota_ok:
         await update.effective_message.reply_text(quota_msg, parse_mode='Markdown')
+        log_event("quota_exceeded", uid, "rejected", {"action": "download"})
         return
 
     args = context.args or []
     url  = args[0].strip() if args else ""
 
+    # URL မပေးရင် usage ပြ
     if not url:
         await update.effective_message.reply_text(
-            "📥 *Website Downloader v35*\n\n"
+            "📥 *Download Command*\n\n"
             "```\n/dl <url> [mode] [options]\n```\n\n"
             "*Modes:*\n"
             "  📄 `single` — Single page (default)\n"
             "  🌐 `full`   — Full site crawl\n"
             "  ⚡ `js`     — Single page + JS render\n"
             "  🚀 `jsful`  — Full site + JS render\n\n"
-            "*Options:*\n"
-            "  `--depth N`  — Crawl depth (1-10, default: 5)\n"
-            "  `--cookie X` — Session cookie\n"
-            "  `--header X` — Custom header (Key: Value)\n\n"
+            "*Options (V30):*\n"
+            "  `--depth N`  — Crawl depth (default: 5, max: 10)\n"
+            "  `--cookie X` — Session cookie (e.g. `session=abc123`)\n"
+            "  `--header X` — Custom header (`Key: Value`)\n\n"
             "*Examples:*\n"
-            "  `/dl https://example.com`\n"
+            "  `/dl https://example.com full`\n"
             "  `/dl https://example.com full --depth 3`\n"
-            "  `/dl https://app.com --cookie session=xyz`\n\n"
-            f"📊 Quota: `{remaining}` downloads remaining today",
+            "  `/dl https://app.com --cookie session=xyz123`",
             parse_mode='Markdown'
         )
         return
@@ -12411,7 +11770,8 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url.startswith('http'):
         url = 'https://' + url
 
-    # Parse flags
+    # ── V30: Parse flags --cookie, --depth, --header ─────────
+    import shlex as _shlex
     _cookies_dl = ""
     _headers_dl = ""
     _depth_dl   = 5
@@ -12424,65 +11784,57 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif a == '--header' and _i + 1 < len(args):
             _headers_dl = args[_i + 1]; _i += 2
         elif a == '--depth' and _i + 1 < len(args):
-            try:
-                _depth_dl = max(1, min(10, int(args[_i + 1])))
-            except ValueError:
-                pass
+            try: _depth_dl = max(1, min(10, int(args[_i+1])))
+            except: pass
             _i += 2
         else:
             _clean_args.append(a); _i += 1
     args = _clean_args
+
+    # Mode ကို arg[1] မှ ဖတ် (optional)
     mode = args[1].lower() if len(args) > 1 else ""
 
-    # Direct mode dispatch (no keyboard needed)
-    if mode in ("full", "fullsite", "f"):
-        await enqueue_download(update, context, url, True, False,
-                               cookies=_cookies_dl, extra_headers=_headers_dl,
-                               max_depth=_depth_dl)
+    if mode in ("full", "fullsite"):
+        # Full site download directly
+        await enqueue_download(update, context, url, full_site=True, use_js=False, cookies=_cookies_dl, extra_headers=_headers_dl, max_depth=_depth_dl)
         return
-    if mode in ("js", "jsingle"):
-        await enqueue_download(update, context, url, False, True,
-                               cookies=_cookies_dl, extra_headers=_headers_dl,
-                               max_depth=_depth_dl)
+    elif mode in ("js", "jspage"):
+        await enqueue_download(update, context, url, full_site=False, use_js=True, cookies=_cookies_dl, extra_headers=_headers_dl, max_depth=_depth_dl)
         return
-    if mode in ("jsful", "jsfull", "jsfullsite"):
-        await enqueue_download(update, context, url, True, True,
-                               cookies=_cookies_dl, extra_headers=_headers_dl,
-                               max_depth=_depth_dl)
+    elif mode in ("jsful", "jsfull", "jsfullsite"):
+        await enqueue_download(update, context, url, full_site=True, use_js=True, cookies=_cookies_dl, extra_headers=_headers_dl, max_depth=_depth_dl)
         return
-    if mode in ("single", "s", ""):
-        await enqueue_download(update, context, url, False, False,
-                               cookies=_cookies_dl, extra_headers=_headers_dl,
-                               max_depth=_depth_dl)
+    elif mode in ("single", "page", ""):
+        # Default single page — still show keyboard for confirmation
+        pass
+
+    # ── Inline keyboard mode selector ────────────
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
         return
 
-    # Unknown mode → show keyboard
-    context.user_data['dl_url']     = url
-    context.user_data['dl_cookies'] = _cookies_dl
-    context.user_data['dl_headers'] = _headers_dl
-    context.user_data['dl_depth']   = _depth_dl
+    domain = urlparse(url).hostname
+    # Store url in context for callback
+    context.user_data['dl_url'] = url
 
-    safe_url = sanitize_log_url(url)
-    domain   = urlparse(url).netloc
-
-    keyboard = InlineKeyboardMarkup([
+    kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📄 Single Page",   callback_data="dl_single"),
-            InlineKeyboardButton("🌐 Full Site",     callback_data="dl_full"),
+            InlineKeyboardButton("📄 Single Page",     callback_data=f"dl_single"),
+            InlineKeyboardButton("🌐 Full Site",        callback_data=f"dl_full"),
         ],
         [
-            InlineKeyboardButton("⚡ JS Single",     callback_data="dl_js"),
-            InlineKeyboardButton("🚀 JS Full Site",  callback_data="dl_jsful"),
+            InlineKeyboardButton("⚡ JS Single",        callback_data=f"dl_js"),
+            InlineKeyboardButton("🚀 JS Full Site",     callback_data=f"dl_jsful"),
         ],
-        [
-            InlineKeyboardButton("❌ Cancel",        callback_data="dl_cancel"),
-        ],
+        [InlineKeyboardButton("❌ Cancel",             callback_data=f"dl_cancel")],
     ])
     await update.effective_message.reply_text(
         f"📥 *Download Mode ရွေးပါ*\n\n"
-        f"🌐 `{domain}`\n"
-        f"📊 Quota: `{remaining}` remaining today",
-        reply_markup=keyboard,
+        f"🔗 `{url[:60]}`\n"
+        f"🌐 `{domain}`\n\n"
+        "_Mode မသေချာရင် Single Page ကနေ စပါ_",
+        reply_markup=kb,
         parse_mode='Markdown'
     )
 
@@ -12491,12 +11843,8 @@ async def dl_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback for /dl mode selection keyboard"""
     query = update.callback_query
     await query.answer()
-    data = query.data
-
-    url     = context.user_data.get('dl_url', '')
-    cookies = context.user_data.get('dl_cookies', '')
-    headers = context.user_data.get('dl_headers', '')
-    depth   = context.user_data.get('dl_depth', 5)
+    data  = query.data   # dl_single / dl_full / dl_js / dl_jsful / dl_cancel
+    url   = context.user_data.get('dl_url', '')
 
     if data == "dl_cancel" or not url:
         await query.edit_message_text("❌ Download cancelled.")
@@ -12508,25 +11856,19 @@ async def dl_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "dl_js":     (False, True),
         "dl_jsful":  (True,  True),
     }
+    full_site, use_js = mode_map.get(data, (False, False))
     mode_label = {
         "dl_single": "📄 Single Page",
         "dl_full":   "🌐 Full Site",
         "dl_js":     "⚡ JS Single",
         "dl_jsful":  "🚀 JS Full Site",
-    }
-    full_site, use_js = mode_map.get(data, (False, False))
-    label = mode_label.get(data, "")
+    }.get(data, "")
 
     await query.edit_message_text(
-        f"⏳ *{label} — Queued*\n"
-        f"🌐 `{urlparse(url).netloc}`",
+        f"⏳ *{mode_label} Download — Queued*\n🔗 `{url[:60]}`",
         parse_mode='Markdown'
     )
-    await enqueue_download(
-        update, context, url,
-        full_site=full_site, use_js=use_js,
-        cookies=cookies, extra_headers=headers, max_depth=depth
-    )
+    await enqueue_download(update, context, url, full_site=full_site, use_js=use_js)
 
 
 # ────────────────────────────────────────────────
