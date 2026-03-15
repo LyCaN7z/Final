@@ -337,7 +337,7 @@ def _reset_session_pool():
     with _SESSION_LOCK:
         for s in _SESSION_POOL.values():
             try: s.close()
-            except Exception as _e: logger.debug("Scan error: %s", _e)
+            except Exception: pass
         _SESSION_POOL.clear()
 
 
@@ -588,19 +588,6 @@ _RE_WEBPACK_CHUNK = re.compile(r'["`\']([a-f0-9]{8,20}\.[a-z0-9]+\.(?:js|css))["
 _RE_SRCSET_PART = re.compile(r'([^\s,]+)(?:\s+(?:\d+(?:\.\d+)?[wx]))?')
 _RE_SW_REGISTER = re.compile(r'''navigator\.serviceWorker\.register\s*\(\s*["`']([^`'"]+)["`']''')
 _RE_WIN_STATE   = re.compile(r'''window\.__(?:INITIAL_STATE|PRELOADED_STATE|NEXT_DATA|NUXT__)__\s*=\s*(\{.{20,5000}?\})''', re.DOTALL)
-
-# ── _PATCH_RE_* aliases — fix NameError in _extract_js_urls / _extract_css_urls ──
-# These functions were written expecting _PATCH_RE_* names but the re.compile()
-# calls above kept the original _RE_* names. Bridge them here.
-_PATCH_RE_JS_URL      = _RE_JS_FULL_URL    # full https?:// URLs inside JS bundles
-_PATCH_RE_NEXT_CHUNK  = _RE_NEXT_CHUNK     # /_next/static/... chunk paths
-_PATCH_RE_WEBPACK     = _RE_WEBPACK_CHUNK  # webpack content-hash filenames
-_PATCH_RE_SW          = _RE_SW_REGISTER    # navigator.serviceWorker.register() paths
-_PATCH_RE_WIN_STATE   = _RE_WIN_STATE      # window.__INITIAL_STATE__ / __NEXT_DATA__
-_PATCH_RE_JSONLD      = _RE_JSONLD_IMG     # JSON-LD image URLs
-_PATCH_RE_CSS_URL     = _RE_CSS_URL        # url(...) references inside CSS
-_PATCH_RE_CSS_IMPORT  = _RE_CSS_IMPORT     # @import statements inside CSS
-
 # Lazy-load attributes for <img> — extended for modern frameworks
 _LAZY_LOAD_ATTRS = (
     'src', 'data-src', 'data-lazy', 'data-original', 'data-lazy-src',
@@ -608,18 +595,6 @@ _LAZY_LOAD_ATTRS = (
     'data-full-src', 'data-image', 'data-img', 'data-bg',
     'data-background', 'data-poster', 'data-thumb', 'data-url',
     'data-large-image', 'data-zoom-image',
-)
-_LAZY_ATTRS = _LAZY_LOAD_ATTRS   # alias — fix NameError in extract_assets()
-
-# ── Downloadable file extensions — used in extract_assets() <a href> scanner ──
-_DOWNLOADABLE_EXTS = (
-    '.pdf', '.zip', '.tar', '.gz', '.bz2', '.xz', '.rar', '.7z', '.tar.gz',
-    '.mp4', '.mp3', '.avi', '.mov', '.mkv', '.webm', '.ogg', '.flac', '.wav',
-    '.exe', '.dmg', '.apk', '.deb', '.rpm', '.msi', '.pkg',
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp',
-    '.csv', '.json', '.xml', '.sql', '.sqlite', '.db',
-    '.woff', '.woff2', '.ttf', '.eot', '.otf',
-    '.iso', '.img', '.bin', '.torrent',
 )
 
 
@@ -919,8 +894,8 @@ async def safe_edit(msg, text: str, max_retries: int = 2, **kwargs) -> bool:
                     else:
                         await msg.edit_text(safe_text, **new_kwargs)
                     return True
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
             logger.debug("safe_edit BadRequest: %s", err[:100])
             return False
@@ -1008,40 +983,6 @@ def admin_only(func):
 # ══════════════════════════════════════════════════
 # 🚨  ADMIN ERROR NOTIFY — Unhandled error → Admin DM
 # ══════════════════════════════════════════════════
-
-# ── v35: Scan error formatter — used by all cmd_ handlers ─────────────────────
-_SCAN_ERROR_HINTS = {
-    "ConnectionError":     ("🌐 ချိတ်ဆက်မရဘူး", "VPN သုံးပါ သို့မဟုတ် site offline ဖြစ်နေတယ်"),
-    "Timeout":             ("⏱️ Request timeout", "Site နှေးနေ — retry လုပ်ကြည့်ပါ"),
-    "TimeoutError":        ("⏱️ Request timeout", "Site နှေးနေ — retry လုပ်ကြည့်ပါ"),
-    "ReadTimeout":         ("⏱️ Read timeout", "Site ကြည့်မရ — ကျဆင်းနေနိုင်"),
-    "ConnectTimeout":      ("⏱️ Connect timeout", "Server မရှာတွေ့ဘူး"),
-    "SSLError":            ("🔒 SSL error", "Certificate ပြဿနာ — `--no-ssl` mode သုံးပါ"),
-    "TooManyRedirects":    ("🔄 Redirect loop", "Site configure မမှန်ဘူး"),
-    "InvalidURL":          ("🔗 Invalid URL", "URL format မှန်မှန် ထည့်ပါ"),
-    "ProxyError":          ("🔀 Proxy error", "Proxy settings စစ်ဆေးပါ"),
-    "MemoryError":         ("💾 Memory မလောက်ဘူး", "Site ကြီးလွန်းတယ် — single mode သုံးပါ"),
-    "OSError":             ("💽 File error", "Disk space စစ်ဆေးပါ"),
-    "RecursionError":      ("🔁 Recursion limit", "Site structure ရှုပ်ထွေးတယ်"),
-    "UnicodeDecodeError":  ("📝 Encoding error", "Site encoding မှားနေတယ်"),
-}
-
-def _fmt_scan_error(exc: Exception, url: str = "") -> str:
-    """Format a scan exception into a user-friendly Telegram message."""
-    err_name = type(exc).__name__
-    title, tip = _SCAN_ERROR_HINTS.get(err_name, (f"⚠️ {err_name}", str(exc)[:80]))
-    domain = ""
-    try:
-        from urllib.parse import urlparse as _up
-        domain = urlparse(url).netloc if url else ""
-    except Exception:
-        pass
-    domain_line = f"\n🌐 `{domain}`" if domain else ""
-    return (
-        f"❌ *Scan Error*{domain_line}\n\n"
-        f"{title}\n"
-        f"💡 _{tip}_"
-    )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler — Admin ဆီ Telegram message ပို့မည်"""
@@ -1183,8 +1124,8 @@ async def queue_worker(worker_id: int = 0):
                         "⏰ Download timeout (1h) exceeded. Please try a smaller site.",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
             except asyncio.CancelledError:
                 logger.info("Queue worker #%d: download cancelled for uid=%d", worker_id, uid)
@@ -1215,8 +1156,8 @@ async def queue_worker(worker_id: int = 0):
             logger.error("Queue worker #%d task unpack error: %s", worker_id, e)
             try:
                 _dl_queue.task_done()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
             await asyncio.sleep(1)
 
 
@@ -2186,8 +2127,8 @@ def extract_assets(html: str, page_url: str, soup=None) -> Set[str]:
             p = urlparse(u)
             if p.scheme in ('http', 'https') and p.netloc:
                 clean.add(u)
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+        except Exception:
+            pass
 
     return clean
 
@@ -2228,7 +2169,7 @@ def fetch_sitemap(base_url: str) -> set:
         if depth > 3:   # FIX: recursion depth limit
             return
         try:
-            r = requests.get(url, headers=_get_headers(), timeout=min(15,TIMEOUT), verify=False)
+            r = requests.get(url, headers=_get_headers(), timeout=15, verify=False)
             if r.status_code != 200:
                 return
             text = r.text
@@ -2251,7 +2192,7 @@ def fetch_sitemap(base_url: str) -> set:
     # Check robots.txt for sitemap pointer first
     try:
         r = requests.get(f"{root}/robots.txt", headers=HEADERS,
-                         timeout=min(8,TIMEOUT), verify=False)
+                         timeout=8, verify=False)
         if r.status_code == 200:
             for m in _RE_ROBOTS_SM.finditer(r.text):
                 _fetch_one_sitemap(m.group(1).strip())
@@ -2696,7 +2637,7 @@ def _mine_js_bundles(html: str, root: str, proxies) -> list:
     found = set()
     def _fetch_js(js_url):
         try:
-            r = requests.get(js_url, headers=HEADERS, timeout=min(12,TIMEOUT), verify=False)
+            r = requests.get(js_url, headers=HEADERS, timeout=12, verify=False)
             if r.status_code == 200 and len(r.text) > 100:
                 return _extract_api_urls_from_js(r.text, root)
         except Exception as _e:
@@ -2710,8 +2651,8 @@ def _mine_js_bundles(html: str, root: str, proxies) -> list:
                 try:
                     for url in fut.result(timeout=8):
                         found.add(url.split('?')[0])
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in futs: f.cancel()
 
@@ -2724,7 +2665,7 @@ def _check_robots_and_sitemap(root: str, proxies) -> list:
     # robots.txt — Disallow paths with /api/
     try:
         r = requests.get(root + '/robots.txt', headers=HEADERS,
-                         timeout=min(8,TIMEOUT), verify=False)
+                         timeout=8, verify=False)
         if r.status_code == 200:
             for line in r.text.splitlines():
                 line = line.strip()
@@ -2801,7 +2742,7 @@ def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
     # ── Phase 0: Fetch homepage for mining ───────
     homepage_html = None
     try:
-        r0 = requests.get(base_url, headers=HEADERS, timeout=min(12,TIMEOUT), verify=False)
+        r0 = requests.get(base_url, headers=HEADERS, timeout=12, verify=False)
         if r0.status_code == 200:
             homepage_html = r0.text
     except Exception as _e:
@@ -2880,8 +2821,8 @@ def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
                         if any(m in allow.upper() for m in ("PUT","PATCH","DELETE")):
                             endpoint["risk"] += 25
                             endpoint["note"] += " ⚠️WRITE"
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 return endpoint
 
             if r.status_code == 405:   # Method Not Allowed → endpoint exists, try POST
@@ -2898,8 +2839,8 @@ def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
                             if body_p.startswith(('{', '[')):
                                 endpoint["type"]    = "JSON_API"
                                 endpoint["preview"] = body_p
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 return endpoint
 
             if r.status_code in (301, 302, 307, 308):
@@ -3003,8 +2944,8 @@ def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
                     if result and result["url"] not in seen:
                         seen.add(result["url"])
                         found.append(result)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 if progress_cb and done % 15 == 0:
                     progress_cb(
                         f"🔌 Scanning: `{done}/{total}`\n"
@@ -3179,10 +3120,11 @@ def _upload_gofile(zip_path: str, progress_cb=None) -> str | None:
                     f"https://api.gofile.io/contents/{content_id}",
                     json={"attribute": "public", "attributeValue": "true"},
                     headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json"}, timeout=TIMEOUT,
+                             "Content-Type": "application/json"},
+                    timeout=10,
                 )
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)  # non-critical
+            except Exception:
+                pass  # non-critical
 
         result_url = dl_page or direct_link
         logger.info("gofile.io upload success: %s (id=%s)", result_url, content_id)
@@ -3204,7 +3146,8 @@ def _gofile_account_info() -> dict:
         import requests as _req
         resp = _req.get(
             "https://api.gofile.io/accounts/me",
-            headers={"Authorization": f"Bearer {GOFILE_TOKEN}"}, timeout=TIMEOUT
+            headers={"Authorization": f"Bearer {GOFILE_TOKEN}"},
+            timeout=10
         )
         data = resp.json()
         if data.get("status") == "ok":
@@ -3303,8 +3246,8 @@ async def _send_large_file(
                         f"☁️ *{_host_name} upload* နေပါတယ်...\n📦 {size_str}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
             dl_url = await asyncio.to_thread(_uploader, zip_path, progress_cb)
             if dl_url:
                 # Send link instead of file
@@ -3350,8 +3293,8 @@ async def _send_large_file(
                 f"✂️ Split ({size_str}) လုပ်နေပါတယ်...",
                 parse_mode='Markdown'
             )
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+        except Exception:
+            pass
 
     parts = await asyncio.to_thread(split_zip, zip_path)
     os.remove(zip_path)
@@ -3474,10 +3417,6 @@ _VULN_PATHS = [
 
 _SEV_EMOJI = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","INFO":"⚪"}
 _SEV_ORDER = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
-# v2 aliases — fix NameError in scan/probe functions
-_SEV_EMOJI_V2  = _SEV_EMOJI
-_SEV_ORDER_V2  = _SEV_ORDER
-_WRITE_METHODS = {'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS'}
 _SEC_HEADERS = {
     "Strict-Transport-Security": ("HSTS",           "HIGH"),
     "Content-Security-Policy":   ("CSP",            "MEDIUM"),
@@ -3489,21 +3428,6 @@ _SEC_HEADERS = {
 _FAKE_SIGS = [
     b"404", b"not found", b"page not found",
     b"does not exist", b"no such file",
-]
-
-# Enhanced fake-404 signatures used by _is_fake_200_enhanced()
-# Superset of _FAKE_SIGS — byte strings, checked against lowercased HTML snippets
-_ENHANCED_FAKE_SIGS = [
-    b"404", b"not found", b"page not found",
-    b"does not exist", b"no such file",
-    b"page doesn't exist", b"page does not exist",
-    b"couldn't be found", b"could not be found",
-    b"no page found", b"error 404",
-    b"http 404", b"the page you",
-    b"we can't find", b"we couldn't find",
-    b"oops!", b"uh oh", b"something went wrong",
-    b"page has been moved", b"page has been deleted",
-    b"no longer available", b"this page is gone",
 ]
 
 # User-Agents rotation (avoid rate limiting) — 60+ UAs for better evasion (updated 2025/2026)
@@ -3805,7 +3729,8 @@ def detect_site_profile(url: str) -> SiteProfile:
 
     try:
         resp = requests.get(
-            url, headers=_get_headers(), timeout=min(12,TIMEOUT), verify=False,
+            url, headers=_get_headers(),
+            timeout=12, verify=False,
             allow_redirects=True,
             stream=True
         )
@@ -3997,7 +3922,8 @@ def _probe_one(
     try:
         resp = requests.get(
             full_url,
-            headers=_get_headers(), timeout=min(8,TIMEOUT),
+            headers=_get_headers(),
+            timeout=8,
             stream=True,
             allow_redirects=True,
             verify=False,
@@ -4014,8 +3940,8 @@ def _probe_one(
                     break
             try:
                 resp.close()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
             # ── Catch-all filter ───────────────────────────
             if catchall and baseline_hash:
@@ -4054,8 +3980,8 @@ def _probe_one(
                         if trace_resp.status_code == 200:
                             result["note"] = "⚠️ TRACE enabled"
                             result["severity"] = "HIGH" if severity in ("MEDIUM", "LOW") else severity
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
                 try:
                     opts = requests.options(
@@ -4072,16 +3998,16 @@ def _probe_one(
                             result["note"] += f" Allow: {', '.join(sorted(write_methods))}"
                             if len(write_methods) >= 2:
                                 result["severity"] = "CRITICAL" if severity in ("HIGH", "MEDIUM") else severity
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
             return result
 
         elif status == 403:
             try:
                 resp.close()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
             # Include 403 for CRITICAL+HIGH+MEDIUM (not just CRITICAL+HIGH)
             if severity in ("CRITICAL", "HIGH", "MEDIUM"):
                 is_cf = (
@@ -4100,8 +4026,8 @@ def _probe_one(
             # Method Not Allowed — endpoint EXISTS, just doesn't support GET
             try:
                 resp.close()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
             if severity in ("CRITICAL", "HIGH", "MEDIUM"):
                 return {
                     "path": path, "full_url": full_url,
@@ -4115,8 +4041,8 @@ def _probe_one(
             loc = resp.headers.get('Location', '')
             try:
                 resp.close()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
             # Only report redirects to auth pages for HIGH/CRITICAL
             if severity in ("HIGH", "CRITICAL") and any(
                 k in loc.lower() for k in ('login', 'auth', 'signin', 'session', 'sso')
@@ -4131,8 +4057,8 @@ def _probe_one(
         else:
             try:
                 resp.close()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     except requests.exceptions.Timeout:
         pass  # Timeout = path likely doesn't exist or is very slow
@@ -4206,8 +4132,8 @@ def _scan_target_sync(
                     f = fut.result(timeout=15)
                     if f:
                         (protected if f["protected"] else exposed).append(f)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in fmap: f.cancel()
 
@@ -4246,8 +4172,8 @@ def _discover_subdomains_sync(base_url: str, progress_q: list) -> list:
                     result = fut.result(timeout=8)
                     if result:
                         live.append(result)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in futures: f.cancel()
 
@@ -4322,7 +4248,7 @@ def _vuln_scan_sync(url: str, progress_q: list) -> dict:
         f"Workers: `{vuln_workers}` | Delay: `{req_delay}s`"
     )
     try:
-        r0   = requests.get(url, timeout=TIMEOUT, headers=_get_headers(),
+        r0   = requests.get(url, timeout=10, headers=_get_headers(),
                             allow_redirects=True, verify=False)
         hdrs = dict(r0.headers)
         srv  = hdrs.get('Server', 'Unknown')
@@ -4730,8 +4656,6 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Vuln scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
     allowed, wait_sec = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(
@@ -4763,7 +4687,7 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.edit_text(
                         f"🛡️ *Scanning `{domain}`*\n\n{txt}",
                         parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog_loop())
     try:
@@ -4775,7 +4699,7 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _active_scans.pop(uid, None)
         _scan_tasks.pop(uid, None)
         try: await msg.edit_text("🛑 *Vuln scan ရပ်သွားပြီ*", parse_mode='Markdown')
-        except Exception as _e: logger.debug("Scan error: %s", _e)
+        except Exception: pass
         return
     except Exception as e:
         prog.cancel()
@@ -4878,7 +4802,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.edit_text(
                         f"🔌 *Scanning `{domain}`*\n\n{txt}",
                         parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog_loop())
     try:
@@ -4887,10 +4811,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         _active_scans.pop(uid, None)
@@ -5962,8 +5883,6 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "TechStack")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     url = context.args[0].strip()
     if not url.startswith('http'):
@@ -6026,10 +5945,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         detected, notable, status, profile = await asyncio.to_thread(_do_tech_scan)
     except Exception as e:
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
 
     domain = urlparse(url).hostname
@@ -6458,7 +6374,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not js_safe:
                     continue
                 try:
-                    jr = session.get(js_url, timeout=min(12,TIMEOUT), verify=False)
+                    jr = session.get(js_url, timeout=12, verify=False)
                     if jr.status_code == 200 and jr.text.strip():
                         # Make a safe filename from the URL path
                         raw_name = src.split('/')[-1].split('?')[0][:60] or f"script_{js_idx}.js"
@@ -6470,8 +6386,8 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         sources[fname]        = jr.text
                         source_origins[fname] = js_url
                         js_idx += 1
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
             elif script.string and script.string.strip():
                 content_str = script.string.strip()
                 fname       = f"inline_scripts/inline_{inline_idx:03d}.js"
@@ -6514,10 +6430,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sources, source_origins, findings = await asyncio.to_thread(_do_extract)
     except Exception as e:
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
 
     # ── Sort findings by risk ────────────────────────────
@@ -6761,7 +6674,7 @@ def _bypass_sync(url: str) -> list:
                     h[k] = v
             r = requests.request(
                 method, test_url, headers=h,
-                timeout=min(8,TIMEOUT), verify=False,
+                timeout=8, verify=False,
                 allow_redirects=False
             )
             return {
@@ -6894,8 +6807,6 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "403 Bypass")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
     allowed, wait = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
@@ -6923,10 +6834,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = await asyncio.to_thread(_bypass_sync, url)
     except Exception as e:
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
 
     baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
@@ -7112,7 +7020,7 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
     try:
         r = requests.get(
             f"https://crt.sh/?q=%.{domain}&output=json",
-            timeout=min(15,TIMEOUT), headers={"Accept": "application/json"}
+            timeout=15, headers={"Accept": "application/json"}
         )
         if r.status_code == 200:
             seen = set()
@@ -7135,7 +7043,7 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
     try:
         r = requests.get(
             f"https://api.hackertarget.com/hostsearch/?q={domain}",
-            timeout=min(12,TIMEOUT)
+            timeout=12
         )
         if r.status_code == 200 and "error" not in r.text.lower()[:30]:
             for line in r.text.strip().split("\n"):
@@ -7154,7 +7062,7 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
         r = requests.get(
             f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",
             headers={"Accept": "application/json"},
-            timeout=min(12,TIMEOUT)
+            timeout=12
         )
         otx_count = 0
         if r.status_code == 200:
@@ -7175,7 +7083,7 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
         r = requests.get(
             f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=200",
             headers={"Accept": "application/json"},
-            timeout=min(12,TIMEOUT)
+            timeout=12
         )
         urlscan_count = 0
         if r.status_code == 200:
@@ -7202,7 +7110,7 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
         r = requests.get(
             f"https://rapiddns.io/subdomain/{domain}?full=1",
             headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
-            timeout=min(12,TIMEOUT)
+            timeout=12
         )
         rapiddns_count = 0
         if r.status_code == 200:
@@ -7255,8 +7163,8 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
                         hostname, ip = res
                         live_subs.append({"hostname": hostname, "ip": ip})
                         found_all.add(hostname)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in futs:
                 f.cancel()
@@ -7326,8 +7234,8 @@ def _subdomains_sync(domain: str, progress_q: list) -> dict:
                             "status": status, "scheme": scheme,
                             "title": title, "interesting": is_interesting
                         }
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in http_futs: f.cancel()
 
@@ -7406,37 +7314,27 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     _spin_i = [0]
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2.8)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2.8)
             spin = SPINNER_BRAILLE[_spin_i[0] % len(SPINNER_BRAILLE)]
             _spin_i[0] += 1
             txt = progress_q[-1] if progress_q else ""
             if progress_q: progress_q.clear()
             try:
                 await msg.edit_text(
-                    f"📡 *Enumerating `{raw}`*\n\n{spin} {txt}\n_⏱ `{int(time.monotonic()-_scan_t0)}s`_", parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+                    f"📡 *Enumerating `{raw}`*\n\n{spin} {txt}", parse_mode='Markdown')
+            except Exception:
+                pass
 
     prog = asyncio.create_task(_prog())
     try:
         data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         _active_scans.pop(uid, None)
@@ -7898,8 +7796,8 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
                     res = fut.result(timeout=8)
                     if res:
                         found.append(res)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in fmap:
                 f.cancel()
@@ -7924,8 +7822,6 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Fuzzing")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
     if not context.args:
         await update.effective_message.reply_text(
             "📌 *Usage:*\n"
@@ -7975,27 +7871,20 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     _spin_i = [0]
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2.1)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2.1)
             spin = SPINNER_BRAILLE[_spin_i[0] % len(SPINNER_BRAILLE)]
             _spin_i[0] += 1
             txt = progress_q[-1] if progress_q else ""
             if progress_q: progress_q.clear()
             try:
                 await msg.edit_text(
-                    f"🧪 *Fuzzing `{domain}`* [{mode}]\n\n{spin} {txt}\n_⏱ `{int(time.monotonic()-_scan_t0)}s`_", parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+                    f"🧪 *Fuzzing `{domain}`* [{mode}]\n\n{spin} {txt}", parse_mode='Markdown')
+            except Exception:
+                pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -8004,10 +7893,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         _active_scans.pop(uid, None)
@@ -9149,27 +9035,20 @@ async def _do_appassets_extract(update, context, filepath: str, wanted_cats: set
         parse_mode='Markdown'
     )
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     _spin_i = [0]
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(1.5)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(1.5)
             spin = SPINNER_BRAILLE[_spin_i[0] % len(SPINNER_BRAILLE)]
             _spin_i[0] += 1
             txt = progress_q[-1] if progress_q else ""
             if progress_q: progress_q.clear()
             try:
                 await msg.edit_text(
-                    f"📦 *Extracting `{fname}`*\n\n{spin} {txt}\n_⏱ `{int(time.monotonic()-_scan_t0)}s`_", parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+                    f"📦 *Extracting `{fname}`*\n\n{spin} {txt}", parse_mode='Markdown')
+            except Exception:
+                pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -9179,10 +9058,7 @@ async def _do_appassets_extract(update, context, filepath: str, wanted_cats: set
         )
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -9263,7 +9139,7 @@ def _build_context_wordlist(url: str, progress_cb=None) -> tuple:
 
     # ── Scrape homepage + up to 3 internal pages ──
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=min(12,TIMEOUT), verify=False)
+        r = requests.get(url, headers=_get_headers(), timeout=12, verify=False)
         soup = BeautifulSoup(r.text, 'html.parser')
         if progress_cb:
             progress_cb("🌐 Homepage scraped")
@@ -9301,13 +9177,13 @@ def _build_context_wordlist(url: str, progress_cb=None) -> tuple:
         links = list(get_internal_links(r.text, url))[:3]
         for link in links:
             try:
-                r2 = requests.get(link, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+                r2 = requests.get(link, headers=_get_headers(), timeout=8, verify=False)
                 soup2 = BeautifulSoup(r2.text, 'html.parser')
                 for tag in soup2.find_all(['h1','h2','h3','title','p']):
                     for w in re.findall(r'[a-zA-Z0-9_\-]{3,20}', tag.get_text()):
                         all_words.add(w.lower())
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     except Exception as e:
         if progress_cb:
@@ -9423,8 +9299,8 @@ def _smartfuzz_probe_sync(base_url: str, wordlist: list, progress_cb=None) -> li
                     res = fut.result(timeout=6)
                     if res:
                         found.append(res)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
         except concurrent.futures.TimeoutError:
             for f in fmap: f.cancel()
             if progress_cb:
@@ -9486,27 +9362,20 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     _spin_i = [0]
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2.1)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2.1)
             spin = SPINNER_BRAILLE[_spin_i[0] % len(SPINNER_BRAILLE)]
             _spin_i[0] += 1
             txt = progress_q[-1] if progress_q else ""
             if progress_q: progress_q.clear()
             try:
                 await msg.edit_text(
-                    f"🗂️ *SmartFuzz — `{domain}`*\n\n{spin} {txt}\n_⏱ `{int(time.monotonic()-_scan_t0)}s`_", parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+                    f"🗂️ *SmartFuzz — `{domain}`*\n\n{spin} {txt}", parse_mode='Markdown')
+            except Exception:
+                pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -9525,10 +9394,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -9858,27 +9724,20 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Phase 4: Brute-force (in thread) ─────────
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     _spin_i = [0]
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(1.5)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(1.5)
             spin = SPINNER_BRAILLE[_spin_i[0] % len(SPINNER_BRAILLE)]
             _spin_i[0] += 1
             txt = progress_q[-1] if progress_q else ""
             if progress_q: progress_q.clear()
             try:
                 await msg.edit_text(
-                    f"🎟️ *JWT Attacker*\n\n🔑 {spin} {txt}\n_⏱ `{int(time.monotonic()-_scan_t0)}s`_", parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+                    f"🎟️ *JWT Attacker*\n\n🔑 {spin} {txt}", parse_mode='Markdown')
+            except Exception:
+                pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -10111,8 +9970,8 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📱 *Analyzing `{fname}`*\n\n{txt}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
     prog_task = asyncio.create_task(_prog_loop())
 
@@ -10216,8 +10075,8 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 d = urlparse(u).netloc
                 domain_map.setdefault(d, []).append(u)
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
         lines.append(f"*🌐 Hosts Found ({len(domain_map)} unique):*")
         for domain, durls in sorted(domain_map.items(), key=lambda x: -len(x[1]))[:10]:
             lines.append(f"  🔵 `{domain}` ({len(durls)} URLs)")
@@ -10727,8 +10586,8 @@ async def _run_download(
                         f"{last_txt or '⏳ ပြင်ဆင်နေပါတယ်...'}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 continue
             last_txt = txt
             spin = SPINNER_BRAILLE[int(time.monotonic() * 2) % len(SPINNER_BRAILLE)]
@@ -10747,8 +10606,8 @@ async def _run_download(
                         return
             except asyncio.CancelledError:
                 return
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     prog = asyncio.create_task(progress_loop())
 
@@ -10870,8 +10729,8 @@ async def _run_download(
                     await asyncio.sleep(3)
             try:
                 os.remove(files[0])
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
             await msg.edit_text(
                 f"✅ *ပြီးပါပြီ* 🎉\n{base_cap}",
                 parse_mode='Markdown'
@@ -11172,8 +11031,8 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (idx + 1) % 10 == 0:              # progress every 10 users
             try:
                 await status_msg.edit_text(f"📢 Broadcasting... `{sent}` sent | `{failed}` failed")
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
     await status_msg.edit_text(
         f"✅ Broadcast ပြီးပါပြီ\n"
         f"✉️ Sent: `{sent}` | ❌ Failed: `{failed}` | ⏭ Skipped (banned): `{skipped}`",
@@ -11500,8 +11359,8 @@ def analyze_app_file(filepath: str, progress_cb=None) -> dict:
                         '/api/', '/rest/', '/v1/', '/v2/', '/graphql', '/auth', '/user'
                     ]):
                         api_paths.add(p)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
             elif u.startswith('/'):
                 api_paths.add(u)
 
@@ -11732,8 +11591,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _con = _get_con()
                 _con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 _con.close()
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
             db_size = os.path.getsize(SQLITE_FILE)
             with open(SQLITE_FILE, 'rb') as f:
                 db_bytes = f.read()
@@ -11841,7 +11700,7 @@ async def cmd_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _do():
         try:
-            r = requests.get(url, headers=_get_headers(), timeout=min(15,TIMEOUT), verify=False,
+            r = requests.get(url, headers=_get_headers(), timeout=15, verify=False,
                              allow_redirects=True)
             return r.status_code, dict(r.headers), r.elapsed.total_seconds()
         except Exception as e:
@@ -11931,7 +11790,7 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _do():
         try:
-            r = requests.get(url, headers=_get_headers(), timeout=min(15,TIMEOUT), verify=False)
+            r = requests.get(url, headers=_get_headers(), timeout=15, verify=False)
             soup = BeautifulSoup(r.text, _BS_PARSER)
             base_netloc = urlparse(url).netloc
             internal, external = [], []
@@ -12009,7 +11868,7 @@ async def cmd_robots(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _do():
         try:
-            r = requests.get(robots_url, headers=_get_headers(), timeout=TIMEOUT, verify=False)
+            r = requests.get(robots_url, headers=_get_headers(), timeout=10, verify=False)
             return r.status_code, r.text
         except Exception as e:
             return 0, str(e)
@@ -12094,7 +11953,7 @@ async def cmd_whois(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             r = requests.get(
                 f"https://rdap.org/domain/{domain}",
-                timeout=min(8,TIMEOUT), headers={'Accept': 'application/json'}
+                timeout=8, headers={'Accept': 'application/json'}
             )
             if r.status_code == 200:
                 data = r.json()
@@ -12172,7 +12031,7 @@ async def cmd_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _do():
         try:
-            r = requests.get(url, headers=_get_headers(), timeout=min(12,TIMEOUT), verify=False, allow_redirects=True)
+            r = requests.get(url, headers=_get_headers(), timeout=12, verify=False, allow_redirects=True)
             cookies_raw = r.headers.get_all('Set-Cookie') if hasattr(r.headers, 'get_all') else []
             if not cookies_raw:
                 # requests combines Set-Cookie; use raw response
@@ -12761,7 +12620,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _do_tech_scan_sync(url: str) -> dict:
     """Sync tech detection — returns {detected: {cat: [items]}, headers: {}}"""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=min(15,TIMEOUT),
+        r = requests.get(url, headers=_get_headers(), timeout=15,
                          verify=False, allow_redirects=True, stream=True)
         buf = io.BytesIO()
         for chunk in r.iter_content(32768):
@@ -12788,7 +12647,7 @@ def _do_tech_scan_sync(url: str) -> dict:
 def _do_headers_scan_sync(url: str) -> dict:
     """Sync HTTP headers fetch."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=min(12,TIMEOUT),
+        r = requests.get(url, headers=_get_headers(), timeout=12,
                          verify=False, allow_redirects=True)
         hdrs = dict(r.headers)
         hdrs_l = {k.lower(): v for k, v in hdrs.items()}
@@ -12811,7 +12670,7 @@ def _do_whois_scan_sync(domain: str) -> dict:
         results['ip'] = f"ERROR: {e}"
     try:
         r = requests.get(f"https://rdap.org/domain/{domain}",
-                         timeout=min(8,TIMEOUT), headers={'Accept': 'application/json'})
+                         timeout=8, headers={'Accept': 'application/json'})
         if r.status_code == 200:
             data = r.json()
             results['registrar'] = next(
@@ -12831,7 +12690,7 @@ def _do_whois_scan_sync(domain: str) -> dict:
 def _do_cookies_scan_sync(url: str) -> dict:
     """Sync cookie fetch and parse."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=min(12,TIMEOUT),
+        r = requests.get(url, headers=_get_headers(), timeout=12,
                          verify=False, allow_redirects=True)
         cookies = []
         for ck in r.cookies:
@@ -12851,7 +12710,7 @@ def _do_robots_scan_sync(url: str) -> dict:
     parsed_url = urlparse(url)
     robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
     try:
-        r = requests.get(robots_url, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+        r = requests.get(robots_url, headers=_get_headers(), timeout=8, verify=False)
         if r.status_code != 200:
             return {"disallow": [], "sitemaps": [], "status": r.status_code}
         disallows, sitemaps = [], []
@@ -12871,7 +12730,7 @@ def _do_robots_scan_sync(url: str) -> dict:
 def _do_links_scan_sync(url: str) -> dict:
     """Sync page link extraction."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=min(12,TIMEOUT),
+        r = requests.get(url, headers=_get_headers(), timeout=12,
                          verify=False, allow_redirects=True)
         soup = BeautifulSoup(r.text[:200000], _BS_PARSER)
         origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
@@ -12936,8 +12795,6 @@ async def cmd_recon(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domain = urlparse(url).hostname
     _active_scans.set(uid, "Recon")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     # ── Module status tracker (shown as live progress) ────────────────
     _mod_status = {
@@ -12969,8 +12826,8 @@ async def cmd_recon(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2.0)
             try:
                 await status_msg.edit_text(_build_status(), parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     spinner = asyncio.create_task(_spin_task())
 
@@ -13001,7 +12858,7 @@ async def cmd_recon(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mod_status['headers'] = '📌 HTTP Headers 🔄 running...'
         try:
             _results['headers'] = await asyncio.wait_for(
-                asyncio.to_thread(_do_headers_scan_sync, url), timeout=min(15,TIMEOUT)
+                asyncio.to_thread(_do_headers_scan_sync, url), timeout=15
             )
             h_count = len(_results['headers'].get('headers', {}))
             _mark('headers', '📌 HTTP Headers', f"`{h_count}` headers")
@@ -13025,7 +12882,7 @@ async def cmd_recon(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mod_status['cookies'] = '🍪 Cookies      🔄 running...'
         try:
             _results['cookies'] = await asyncio.wait_for(
-                asyncio.to_thread(_do_cookies_scan_sync, url), timeout=min(15,TIMEOUT)
+                asyncio.to_thread(_do_cookies_scan_sync, url), timeout=15
             )
             ck_count = len(_results['cookies'].get('cookies', []))
             _mark('cookies', '🍪 Cookies     ', f"`{ck_count}` cookies")
@@ -13037,7 +12894,7 @@ async def cmd_recon(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mod_status['robots'] = '🤖 Robots.txt   🔄 running...'
         try:
             _results['robots'] = await asyncio.wait_for(
-                asyncio.to_thread(_do_robots_scan_sync, url), timeout=min(12,TIMEOUT)
+                asyncio.to_thread(_do_robots_scan_sync, url), timeout=12
             )
             dis = len(_results['robots'].get('disallow', []))
             _mark('robots', '🤖 Robots.txt  ', f"`{dis}` disallow rules")
@@ -13187,8 +13044,6 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "Discover")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     args = context.args or []
     url  = args[0].strip() if args else ""
@@ -13252,8 +13107,8 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1.5)
             try:
                 await status_msg.edit_text(_build_discover_status(), parse_mode='Markdown')
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     spinner_task = asyncio.create_task(_spin_task())
 
@@ -13415,7 +13270,7 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(
                 f"❌ *Discover Error — `{domain}`*\n\n`{type(_e).__name__}: {_e}`",
                 parse_mode='Markdown')
-        except Exception as _e: logger.debug("Scan error: %s", _e)
+        except Exception: pass
 
     finally:
         _active_scans.pop(uid, None)
@@ -13685,8 +13540,8 @@ def _analyze_source_sync(domain: str) -> dict:
                                 "label": label, "excerpt": display,
                                 "file": rel_path[:60], "line": line_no,
                             })
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
         # ── 2. Routes + hidden endpoints (JS only) ───────────────────
         if ext in ('.js', '.jsx', '.ts', '.tsx'):
@@ -13743,8 +13598,8 @@ def _analyze_source_sync(domain: str) -> dict:
                                 "fix_ver": info["vuln_lt"],
                                 "cve": info["cve"], "severity": info["sev"],
                             })
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     # Finalize
     result["stats"]["total_secrets"] = len(result["secrets"])
@@ -13808,8 +13663,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _active_scans.set(uid, "Source Analyze")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     msg = await update.effective_message.reply_text(
         f"🔬 *Analyzing* `{domain}`...\n\n"
@@ -14034,10 +13887,10 @@ def _apitest_sync(base_url: str, progress_q: list) -> dict:
                                         "preview": tv[:16] + "***" + tv[-4:],
                                         "source": path + " (POST)", "full": tv,
                                     })
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     result["tokens_found"] = [{"type": t["type"], "preview": t["preview"], "source": t["source"]}
                                for t in found_tokens]
@@ -14095,8 +13948,8 @@ def _apitest_sync(base_url: str, progress_q: list) -> dict:
                 result["cors_issues"].append({
                     "url": ep_info["url"], "acao": acao, "acac": acac,
                 })
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+        except Exception:
+            pass
 
     return result
 
@@ -14152,13 +14005,7 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(3)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(3)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
@@ -14166,8 +14013,8 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🔐 *API Token Test — `{domain}`*\n\n{txt}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -14740,8 +14587,6 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _active_scans.set(uid, "Code Audit")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     msg = await update.effective_message.reply_text(
         f"🔍 *Code Audit — `{domain}`*\n\n"
@@ -15451,22 +15296,15 @@ async def cmd_techstack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_db_sync(_db)
 
     progress_q = []
-    _scan_t0 = time.monotonic()
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(
                         f"🔍 *TechStack — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -15482,15 +15320,11 @@ async def cmd_techstack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         _active_scans.pop(uid, None)
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     detected = data.get("detected", {})
     total_tech = sum(len(v) for v in detected.values())
@@ -15824,7 +15658,7 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
 
     # ── Baseline fingerprint (detect false positives) ──────────────
     try:
-        _baseline_resp = session.get(base_url, params=params, timeout=TIMEOUT)
+        _baseline_resp = session.get(base_url, params=params, timeout=10)
         _baseline_len  = len(_baseline_resp.text)
         _baseline_hash = hashlib.md5(_baseline_resp.text[:2000].encode()).hexdigest()
     except Exception:
@@ -15832,12 +15666,6 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
         _baseline_hash = ""
 
     def _check_error(body: str) -> tuple:
-        # Skip if response looks like a custom 404/error page (false positive filter)
-        if len(body) < 50 or any(s in body[:500].lower() for s in (
-            b'404 not found'.decode(), b'page not found'.decode(),
-            b'does not exist'.decode(),
-        )):
-            return False, ""
         body_l = body.lower()
         for db_type, patterns in _SQLI_ERRORS.items():
             for pat in patterns:
@@ -15849,7 +15677,7 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
         try:
             test_params = dict(params)
             test_params[param] = payload
-            r = session.get(base_url, params=test_params, timeout=TIMEOUT)
+            r = session.get(base_url, params=test_params, timeout=10)
             return _check_error(r.text)
         except Exception as _e:
             logging.debug("SQLi GET error: %s", _e)
@@ -15861,7 +15689,7 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
             post_data = dict(params)
             post_data[param] = payload
             # Try form-data first
-            r = session.post(base_url, data=post_data, timeout=TIMEOUT)
+            r = session.post(base_url, data=post_data, timeout=10)
             db, pat = _check_error(r.text)
             if db: return db, pat
             # Try JSON body
@@ -15878,7 +15706,7 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
         try:
             inj_headers = dict(_get_headers())
             inj_headers[header_name] = payload
-            r = session.get(base_url, headers=inj_headers, timeout=TIMEOUT)
+            r = session.get(base_url, headers=inj_headers, timeout=10)
             return _check_error(r.text)
         except Exception as _e:
             logging.debug("SQLi header error: %s", _e)
@@ -15888,8 +15716,8 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
         try:
             p_t = dict(params); p_t[param] = true_pay
             p_f = dict(params); p_f[param] = false_pay
-            r_t = session.get(base_url, params=p_t, timeout=min(8,TIMEOUT))
-            r_f = session.get(base_url, params=p_f, timeout=min(8,TIMEOUT))
+            r_t = session.get(base_url, params=p_t, timeout=8)
+            r_f = session.get(base_url, params=p_f, timeout=8)
             diff = abs(len(r_t.text) - len(r_f.text))
             # Use difflib ratio for more reliable boolean detection
             similarity = difflib.SequenceMatcher(None, r_t.text[:2000], r_f.text[:2000]).ratio()
@@ -15911,12 +15739,12 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
             for payload in nosql_payloads:
                 post_data = dict(params)
                 post_data[param] = payload
-                r = session.post(base_url, json={param: payload}, timeout=min(8,TIMEOUT))
+                r = session.post(base_url, json={param: payload}, timeout=8)
                 if r.status_code == 200 and len(r.text) > 100:
                     # Check if response differs from baseline (invalid input)
                     baseline = session.post(base_url,
                                             json={param: "invalid_xyz_nosql_test"},
-                                            timeout=min(8,TIMEOUT))
+                                            timeout=8)
                     if abs(len(r.text) - len(baseline.text)) > 100:
                         return True, str(payload)
         except Exception as _e:
@@ -15927,7 +15755,7 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
     def _detect_waf():
         try:
             waf_probe = session.get(base_url,
-                params={"id": "1' OR '1'='1"}, timeout=min(8,TIMEOUT))
+                params={"id": "1' OR '1'='1"}, timeout=8)
             waf_sigs = ["cloudflare", "incapsula", "sucuri", "modsecurity",
                         "barracuda", "f5 big-ip", "imperva", "403 forbidden",
                         "access denied", "request blocked"]
@@ -15935,8 +15763,8 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
             if waf_probe.status_code in (403, 406, 501, 999) or \
                any(s in body_l for s in waf_sigs):
                 return True
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+        except Exception:
+            pass
         return False
 
     # ── Phase 0: WAF Detection ─────────────────────
@@ -16035,8 +15863,8 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
                 t0 = time.time()
                 try:
                     session.get(base_url, params=dict(params), timeout=10)
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 times.append(time.time() - t0)
             _baseline_cache[param] = sum(times) / max(len(times), 1)
         return _baseline_cache[param]
@@ -16078,8 +15906,8 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
                     f"🔴 Time SQLi (Timeout)! Param: `{param}` | Delay: `{delay}s`")
                 time_found_params.add(param)
                 break
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     # ── Phase 4: NoSQL injection ───────────────────
     progress_q.append("🧪 Phase 4: NoSQL injection testing...")
@@ -16142,8 +15970,6 @@ async def cmd_sqli(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "SQLi scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -16158,22 +15984,15 @@ async def cmd_sqli(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_scan(_db, uid, "SQLi", domain)
         _save_db_sync(_db)
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(3)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(3)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(f"💉 *SQLi — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -16189,15 +16008,11 @@ async def cmd_sqli(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         _active_scans.pop(uid, None)
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = data["total_found"]
     severity = "🔴 CRITICAL" if total > 0 else "✅ Not Detected"
@@ -16471,7 +16286,7 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
     soup = None
     csp_value = ""
     try:
-        resp = session.get(url, timeout=min(12,TIMEOUT))
+        resp = session.get(url, timeout=12)
         soup = BeautifulSoup(resp.text, _BS_PARSER)
         csp_value = resp.headers.get("Content-Security-Policy", "")
         results["csp_present"] = bool(csp_value)
@@ -16532,7 +16347,7 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
         try:
             test_params = dict(params)
             test_params[param] = payload
-            r = session.get(base_url, params=test_params, timeout=min(8,TIMEOUT))
+            r = session.get(base_url, params=test_params, timeout=8)
             body = r.text
             if payload.lower() in body.lower():
                 escaped_versions = [
@@ -16546,8 +16361,8 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
                                        ("<script", "onerror", "onload", "onfocus")) else "MEDIUM"
                     return {"param": param, "payload": payload,
                             "status": r.status_code, "severity": sev, "method": "GET"}
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+        except Exception:
+            pass
         return None
 
     # Test in parallel
@@ -16586,7 +16401,7 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
                 continue
             try:
                 fn = session.post if method == 'post' else session.get
-                r_form = fn(form_url, data=form_params, timeout=TIMEOUT, allow_redirects=True)
+                r_form = fn(form_url, data=form_params, timeout=10, allow_redirects=True)
                 body = r_form.text
                 # Check reflection
                 if 'onerror=alert(1)' in body and '<img src=x onerror=alert(1)>' in body:
@@ -16595,8 +16410,8 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
                         "params": list(form_params.keys()), "severity": "HIGH"
                     })
                     progress_q.append(f"🔴 Form XSS! URL: `{form_url}` [{method.upper()}]")
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     # ── Stored XSS check ──────────────────────────
     progress_q.append("🔍 Testing Stored XSS...")
@@ -16622,14 +16437,14 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
             if not safe_ok2:
                 continue
             try:
-                r_post = session.post(form_url, data=post_data, timeout=TIMEOUT, allow_redirects=True)
+                r_post = session.post(form_url, data=post_data, timeout=10, allow_redirects=True)
                 if stored_marker in r_post.text:
                     results["stored"].append({
                         "form_url": form_url, "params": list(post_data.keys()), "severity": "HIGH"
                     })
                     progress_q.append(f"🔴 Stored XSS candidate! Form: `{form_url}`")
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     # ── Header-based XSS (Referer / X-Forwarded-For) ──
     progress_q.append("🔍 Testing header-based XSS reflection...")
@@ -16638,12 +16453,12 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
         try:
             inj_headers = dict(_get_headers())
             inj_headers[header_name] = payload
-            r_hdr = session.get(base_url, headers=inj_headers, timeout=min(8,TIMEOUT))
+            r_hdr = session.get(base_url, headers=inj_headers, timeout=8)
             if payload.lower() in r_hdr.text.lower():
                 results["header_xss"].append({"header": header_name, "payload": payload})
                 progress_q.append(f"🔴 Header XSS! `{header_name}` reflected")
-        except Exception as _e:
-            logger.debug("Scan error: %s", _e)
+        except Exception:
+            pass
 
     results["total_found"] = (
         len(results["reflected"]) + len(results["dom_sinks"]) +
@@ -16690,8 +16505,6 @@ async def cmd_xss(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "XSS scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -16706,22 +16519,15 @@ async def cmd_xss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_scan(_db, uid, "XSS", domain)
         _save_db_sync(_db)
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(3)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(3)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(f"🎯 *XSS — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -16737,15 +16543,11 @@ async def cmd_xss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         _active_scans.pop(uid, None)
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = data["total_found"]
     severity = "🔴 VULNERABLE" if total > 0 else "✅ Not Detected"
@@ -16860,7 +16662,8 @@ def _cloudcheck_sync(domain: str, progress_q: list) -> dict:
 
         # Also check via HTTP headers (more reliable)
         try:
-            r_head = requests.get(f"https://{domain}", headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False, allow_redirects=True)
+            r_head = requests.get(f"https://{domain}", headers=_get_headers(),
+                                  timeout=8, verify=False, allow_redirects=True)
             h_str = str(r_head.headers).lower()
             if "cf-ray" in h_str or "cf-cache-status" in h_str or "__cfduid" in h_str:
                 if "Cloudflare" not in results["cdn_detected"]:
@@ -16885,7 +16688,7 @@ def _cloudcheck_sync(domain: str, progress_q: list) -> dict:
         import subprocess as _sp
         mx_result = _sp.run(
             ["nslookup", "-type=MX", domain],
-            capture_output=True, text=True, timeout=min(8,TIMEOUT), shell=False
+            capture_output=True, text=True, timeout=8, shell=False
         )
         for line in mx_result.stdout.splitlines():
             if "mail exchanger" in line.lower() or "mx preference" in line.lower():
@@ -16897,8 +16700,8 @@ def _cloudcheck_sync(domain: str, progress_q: list) -> dict:
                         results["real_ip_candidates"].append({
                             "ip": mx_ip, "source": "MX record", "host": mx_host
                         })
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
     except Exception as _e:
         logging.debug("Scan error: %s", _e)
 
@@ -16932,7 +16735,7 @@ def _cloudcheck_sync(domain: str, progress_q: list) -> dict:
         # HackerTarget passive DNS
         r = requests.get(
             f"https://api.hackertarget.com/hostsearch/?q={domain}",
-            timeout=min(8,TIMEOUT)
+            timeout=8
         )
         if r.status_code == 200 and "error" not in r.text[:30].lower():
             ips_seen = set()
@@ -17044,8 +16847,6 @@ async def cmd_cloudcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "CloudCheck")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     msg = await update.effective_message.reply_text(
         f"☁️ *Cloud/CDN Bypass — `{raw}`*\n\n"
@@ -17053,22 +16854,15 @@ async def cmd_cloudcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(3)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(3)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(f"☁️ *CloudCheck — `{raw}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -17076,15 +16870,11 @@ async def cmd_cloudcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         _active_scans.pop(uid, None)
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     candidates = data.get("real_ip_candidates", [])
     lines = [
@@ -17197,9 +16987,11 @@ def _paramfuzz_sync(url: str, method: str, progress_q: list) -> dict:
     # ── Baseline request ───────────────────────────
     try:
         if method == "GET":
-            r_base = requests.get(base, params=existing, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+            r_base = requests.get(base, params=existing, headers=_get_headers(),
+                                  timeout=8, verify=False)
         else:
-            r_base = requests.post(base, data=existing, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+            r_base = requests.post(base, data=existing, headers=_get_headers(),
+                                   timeout=8, verify=False)
         baseline_len  = len(r_base.text)
         baseline_hash = hashlib.md5(r_base.text[:1000].encode()).hexdigest()
         baseline_code = r_base.status_code
@@ -17208,7 +17000,6 @@ def _paramfuzz_sync(url: str, method: str, progress_q: list) -> dict:
 
     CHUNK = 30  # test 30 params at once
     found_raw = []
-    _pf_t0    = time.monotonic()
 
     for i in range(0, len(_PARAMFUZZ_WORDLIST), CHUNK):
         chunk = _PARAMFUZZ_WORDLIST[i:i+CHUNK]
@@ -17219,9 +17010,11 @@ def _paramfuzz_sync(url: str, method: str, progress_q: list) -> dict:
 
         try:
             if method == "GET":
-                r = requests.get(base, params=test_params, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+                r = requests.get(base, params=test_params, headers=_get_headers(),
+                                 timeout=8, verify=False)
             else:
-                r = requests.post(base, data=test_params, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+                r = requests.post(base, data=test_params, headers=_get_headers(),
+                                  timeout=8, verify=False)
 
             # If different from baseline, narrow down
             if (abs(len(r.text) - baseline_len) > 20 or
@@ -17250,7 +17043,7 @@ def _paramfuzz_sync(url: str, method: str, progress_q: list) -> dict:
                         pass
 
             results["total_tested"] += len(chunk)
-            if i % (CHUNK * 3) == 0:  # More frequent
+            if i % (CHUNK * 5) == 0:
                 progress_q.append(
                     f"🔍 Tested `{results['total_tested']}/{len(_PARAMFUZZ_WORDLIST)}` | "
                     f"`{len(found_raw)}` found"
@@ -17315,8 +17108,6 @@ async def cmd_paramfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "ParamFuzz")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -17325,23 +17116,16 @@ async def cmd_paramfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(3)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(3)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(
                         f"🔬 *ParamFuzz — `{domain}`* [{method}]\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -17357,15 +17141,11 @@ async def cmd_paramfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         _active_scans.pop(uid, None)
-        await msg.edit_text(
-            _fmt_scan_error(e, url),
-            parse_mode='Markdown'
-        )
+        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     found = data["found_params"]
     interesting = data["interesting"]
@@ -17444,7 +17224,7 @@ def _extract_secrets_sync(url: str, progress_q: list) -> dict:
     results = {"findings": [], "js_count": 0}
     seen    = set()
     try:
-        resp = requests.get(url, headers=_get_headers(), timeout=min(15,TIMEOUT), verify=False, allow_redirects=True)
+        resp = requests.get(url, headers=_get_headers(), timeout=15, verify=False, allow_redirects=True)
         soup = BeautifulSoup(resp.text, _BS_PARSER)
         sources = {"index.html": resp.text}
         js_idx = 0
@@ -17454,12 +17234,12 @@ def _extract_secrets_sync(url: str, progress_q: list) -> dict:
             safe_ok, _ = is_safe_url(js_url)
             if not safe_ok: continue
             try:
-                jr = requests.get(js_url, headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False)
+                jr = requests.get(js_url, headers=_get_headers(), timeout=8, verify=False)
                 if jr.status_code == 200 and jr.text.strip():
                     sources[f"js_{js_idx:03d}.js"] = jr.text
                     js_idx += 1
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
         results["js_count"] = js_idx
         for fname, content in sources.items():
             for stype, (pattern, risk) in _SECRET_PATTERNS.items():
@@ -17802,7 +17582,7 @@ def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
         baseline_resp = session.post(login_url, data={
             username_field: "zz_invalid_user_zz",
             password_field: "zz_invalid_pass_zz"
-        }, timeout=TIMEOUT, allow_redirects=True)
+        }, timeout=10, allow_redirects=True)
         baseline_len  = len(baseline_resp.text)
         baseline_url  = baseline_resp.url
         baseline_code = baseline_resp.status_code
@@ -17817,7 +17597,8 @@ def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
         json_test = session.post(
             login_url,
             json={username_field: "test", password_field: "test"},
-            headers={**_get_headers(), "Content-Type": "application/json"}, timeout=min(8,TIMEOUT)
+            headers={**_get_headers(), "Content-Type": "application/json"},
+            timeout=8
         )
         if json_test.status_code not in (415, 400) and \
            "application/json" in json_test.headers.get("Content-Type",""):
@@ -17835,7 +17616,6 @@ def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
     total_attempts = min(len(usernames) * len(passwords), 300)
     consecutive_429 = 0
     lock = threading.Lock()
-    _brute_t0 = time.monotonic()
 
     def _try_login(uname: str, pwd: str) -> Optional[dict]:
         nonlocal consecutive_429
@@ -17844,16 +17624,18 @@ def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
             if results["json_api"]:
                 resp = session.post(
                     login_url, json=login_payload,
-                    headers={**_get_headers(), "Content-Type": "application/json"}, timeout=TIMEOUT, allow_redirects=True
+                    headers={**_get_headers(), "Content-Type": "application/json"},
+                    timeout=10, allow_redirects=True
                 )
             else:
                 resp = session.post(login_url, data=login_payload,
-                                    timeout=TIMEOUT, allow_redirects=True)
+                                    timeout=10, allow_redirects=True)
                 # Fallback to JSON if form rejected
                 if resp.status_code in (400, 415, 422):
                     resp = session.post(
                         login_url, json=login_payload,
-                        headers={**_get_headers(), "Content-Type": "application/json"}, timeout=TIMEOUT, allow_redirects=True
+                        headers={**_get_headers(), "Content-Type": "application/json"},
+                        timeout=10, allow_redirects=True
                     )
 
             # Rate limit
@@ -17894,8 +17676,8 @@ def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
                     rj.get("success") or rj.get("user") or
                     (rj.get("status") == "success")
                 )
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
             is_success = (
                 json_success or
@@ -17987,8 +17769,6 @@ async def cmd_bruteforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "Brute force")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     # Use custom wordlist if uploaded
     usernames = [target_user] if target_user else (
@@ -18010,7 +17790,6 @@ async def cmd_bruteforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_db_sync(_db)
 
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _show_progress():
         last = 0
@@ -18023,8 +17802,8 @@ async def cmd_bruteforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🔐 *Brute Force — `{urlparse(url).hostname}`*\n\n{latest}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 last = len(progress_q)
 
     prog_task = asyncio.create_task(_show_progress())
@@ -18090,7 +17869,7 @@ def _sourcemap_sync(url: str, progress_q: list) -> dict:
     # ── Step 1: Find all JS files ──────────────────
     progress_q.append("🗺️ Fetching page to find JS files...")
     try:
-        resp = session.get(url, timeout=min(15,TIMEOUT), allow_redirects=True)
+        resp = session.get(url, timeout=15, allow_redirects=True)
         soup = BeautifulSoup(resp.text, _BS_PARSER)
     except Exception as e:
         results["error"] = str(e)
@@ -18128,7 +17907,7 @@ def _sourcemap_sync(url: str, progress_q: list) -> dict:
                 safe_ok, _ = is_safe_url(js_url)
                 if not safe_ok:
                     continue
-                jr = session.get(js_url, timeout=min(12,TIMEOUT))
+                jr = session.get(js_url, timeout=12)
                 if jr.status_code != 200:
                     continue
 
@@ -18156,7 +17935,7 @@ def _sourcemap_sync(url: str, progress_q: list) -> dict:
                     if not safe_ok2:
                         continue
                     try:
-                        mr = session.get(murl, timeout=TIMEOUT)
+                        mr = session.get(murl, timeout=10)
                         if mr.status_code != 200:
                             continue
 
@@ -18245,8 +18024,6 @@ async def cmd_sourcemap(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "SourceMap")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -18254,7 +18031,6 @@ async def cmd_sourcemap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _progress():
         last = 0
@@ -18266,8 +18042,8 @@ async def cmd_sourcemap(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🗺️ *Source Map Scan — `{domain}`*\n\n{progress_q[-1]}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 last = len(progress_q)
 
     task = asyncio.create_task(_progress())
@@ -18375,7 +18151,7 @@ def _gitexposed_sync(url: str, progress_q: list) -> dict:
     progress_q.append("🔓 Checking .git directory exposure...")
     for path in _GIT_PATHS:
         try:
-            r = session.get(base + path, timeout=min(8,TIMEOUT))
+            r = session.get(base + path, timeout=8)
             if r.status_code == 200 and r.text.strip():
                 results["accessible_files"].append({
                     "path": path,
@@ -18403,7 +18179,7 @@ def _gitexposed_sync(url: str, progress_q: list) -> dict:
     progress_q.append("🔓 Checking SVN exposure...")
     for path in _SVN_PATHS:
         try:
-            r = session.get(base + path, timeout=min(8,TIMEOUT))
+            r = session.get(base + path, timeout=8)
             if r.status_code == 200:
                 results["svn_exposed"] = True
                 results["accessible_files"].append({"path": path, "size": len(r.text), "content": r.text})
@@ -18416,7 +18192,7 @@ def _gitexposed_sync(url: str, progress_q: list) -> dict:
     progress_q.append("🔓 Checking Mercurial (.hg) exposure...")
     for path in _HG_PATHS:
         try:
-            r = session.get(base + path, timeout=min(8,TIMEOUT))
+            r = session.get(base + path, timeout=8)
             if r.status_code == 200:
                 results["hg_exposed"] = True
                 results["accessible_files"].append({"path": path, "size": len(r.text), "content": r.text})
@@ -18441,7 +18217,7 @@ def _gitexposed_sync(url: str, progress_q: list) -> dict:
 
         # Try to get COMMIT_EDITMSG for recent commit message
         try:
-            r = session.get(base + "/.git/COMMIT_EDITMSG", timeout=min(8,TIMEOUT))
+            r = session.get(base + "/.git/COMMIT_EDITMSG", timeout=8)
             if r.status_code == 200:
                 results["repo_info"]["last_commit_msg"] = r.text.strip()[:100]
                 zf.writestr("git_dump/COMMIT_EDITMSG", r.text)
@@ -18450,7 +18226,7 @@ def _gitexposed_sync(url: str, progress_q: list) -> dict:
 
         # Try to get logs/HEAD for commit history
         try:
-            r = session.get(base + "/.git/logs/HEAD", timeout=min(8,TIMEOUT))
+            r = session.get(base + "/.git/logs/HEAD", timeout=8)
             if r.status_code == 200:
                 commits = []
                 for line in r.text.split('\n')[:10]:
@@ -18522,8 +18298,6 @@ async def cmd_gitexposed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "GitExposed")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -18531,7 +18305,6 @@ async def cmd_gitexposed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _progress():
         last = 0
@@ -18543,8 +18316,8 @@ async def cmd_gitexposed(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🔓 *Git Exposure — `{domain}`*\n\n{progress_q[-1]}",
                         parse_mode='Markdown'
                     )
-                except Exception as _e:
-                    logger.debug("Scan error: %s", _e)
+                except Exception:
+                    pass
                 last = len(progress_q)
 
     task = asyncio.create_task(_progress())
@@ -18701,7 +18474,7 @@ def _ssti_scan_sync(url: str, progress_q: list) -> dict:
                 test_params = dict(params)
                 test_params[param] = payload
                 # Test GET
-                r = session.get(base_url, params=test_params, timeout=min(8,TIMEOUT))
+                r = session.get(base_url, params=test_params, timeout=8)
                 if expected.lower() in r.text.lower():
                     results["vulnerable"].append({
                         "param": param, "payload": payload,
@@ -18713,7 +18486,7 @@ def _ssti_scan_sync(url: str, progress_q: list) -> dict:
                     progress_q.append(f"🔥 SSTI! Param: `{param}` | Engine: `{engine}` [GET]")
                     break
                 # Test POST
-                r2 = session.post(base_url, data=test_params, timeout=min(8,TIMEOUT))
+                r2 = session.post(base_url, data=test_params, timeout=8)
                 if expected.lower() in r2.text.lower():
                     results["vulnerable"].append({
                         "param": param, "payload": payload,
@@ -18724,8 +18497,8 @@ def _ssti_scan_sync(url: str, progress_q: list) -> dict:
                     seen_vulns.add(vuln_key)
                     progress_q.append(f"🔥 SSTI! Param: `{param}` | Engine: `{engine}` [POST]")
                     break
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     results["total_found"] = len(results["vulnerable"])
     return results
@@ -18762,28 +18535,19 @@ async def cmd_ssti(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "SSTI scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
         f"🔥 *SSTI Scan — `{domain}`*\n\n⏳ Testing template injection...", parse_mode='Markdown')
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try: await msg.edit_text(f"🔥 *SSTI — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -18799,7 +18563,6 @@ async def cmd_ssti(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = data["total_found"]
     lines = [
@@ -18931,28 +18694,19 @@ async def cmd_cors(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running*", parse_mode='Markdown')
         return
     _active_scans.set(uid, "CORS scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
         f"🌐 *CORS Scan — `{domain}`*\n\n⏳ Testing origins...", parse_mode='Markdown')
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try: await msg.edit_text(f"🌐 *CORS — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     try:
@@ -18960,7 +18714,6 @@ async def cmd_cors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = len(data["findings"])
     crit_count = len([f for f in data["findings"] if f["severity"] == "CRITICAL"])
@@ -19036,7 +18789,7 @@ def _openredirect_scan_sync(url: str, progress_q: list) -> dict:
             try:
                 test_params = dict(params)
                 test_params[param] = payload
-                r = session.get(base_url, params=test_params, timeout=min(8,TIMEOUT),
+                r = session.get(base_url, params=test_params, timeout=8,
                                 allow_redirects=False)
                 loc = r.headers.get("Location", "")
                 # Vulnerable if redirected to our payload domain
@@ -19049,8 +18802,8 @@ def _openredirect_scan_sync(url: str, progress_q: list) -> dict:
                     })
                     progress_q.append(f"🔀 Open Redirect! Param: `{param}` → `{loc[:50]}`")
                     break
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     results["total_found"] = len(results["vulnerable"])
     return results
@@ -19085,28 +18838,19 @@ async def cmd_openredirect(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running*", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Open Redirect scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
         f"🔀 *Open Redirect Scan — `{domain}`*\n\n⏳ Testing...", parse_mode='Markdown')
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try: await msg.edit_text(f"🔀 *Redirect — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -19122,7 +18866,6 @@ async def cmd_openredirect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = data["total_found"]
     lines = [
@@ -19256,7 +18999,7 @@ def _lfi_scan_sync(url: str, progress_q: list) -> dict:
             try:
                 test_params = dict(params)
                 test_params[param] = payload
-                r = session.get(base_url, params=test_params, timeout=min(8,TIMEOUT))
+                r = session.get(base_url, params=test_params, timeout=8)
                 for indicator in _LFI_INDICATORS:
                     if re.search(indicator, r.text, re.I):
                         results["vulnerable"].append({
@@ -19269,8 +19012,8 @@ def _lfi_scan_sync(url: str, progress_q: list) -> dict:
                         seen_vulns.add(vuln_key)
                         progress_q.append(f"🔴 LFI! Param: `{param}` | `{payload[:40]}`")
                         break
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     results["total_found"] = len(results["vulnerable"])
     return results
@@ -19309,28 +19052,19 @@ async def cmd_lfi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running*", parse_mode='Markdown')
         return
     _active_scans.set(uid, "LFI scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
         f"📂 *LFI Scan — `{domain}`*\n\n⏳ Testing file inclusion...", parse_mode='Markdown')
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try: await msg.edit_text(f"📂 *LFI — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -19346,7 +19080,6 @@ async def cmd_lfi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = data["total_found"]
     lines = [
@@ -19460,7 +19193,7 @@ def _secretscan_sync(url: str, progress_q: list) -> dict:
     # ── Step 1: Scan main page HTML ───────────────
     progress_q.append("🔍 Scanning main page HTML...")
     try:
-        resp = session.get(url, timeout=min(12,TIMEOUT))
+        resp = session.get(url, timeout=12)
         results["pages_scanned"] += 1
         _scan_text(resp.text, "HTML")
 
@@ -19482,11 +19215,11 @@ def _secretscan_sync(url: str, progress_q: list) -> dict:
         # ── Step 3: Scan each JS file ─────────────
         def _fetch_and_scan(js_url):
             try:
-                r = session.get(js_url, timeout=TIMEOUT)
+                r = session.get(js_url, timeout=10)
                 if r.status_code == 200:
                     _scan_text(r.text, js_url.split('/')[-1][:40])
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
             list(ex.map(_fetch_and_scan, results["js_files"]))
@@ -19508,8 +19241,8 @@ def _secretscan_sync(url: str, progress_q: list) -> dict:
                     _scan_text(r.text, path)
                     if any(kw in r.text.lower() for kw in ['key', 'secret', 'token', 'password']):
                         progress_q.append(f"🔴 Sensitive file accessible: `{path}`")
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
 
     except Exception as e:
         progress_q.append(f"⚠️ Error: {e}")
@@ -19556,8 +19289,6 @@ async def cmd_secretscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Secret Scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -19570,23 +19301,16 @@ async def cmd_secretscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_db_sync(_db)
 
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(
                         f"🔑 *Secret Scanner — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -19602,7 +19326,6 @@ async def cmd_secretscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     total = data["total_found"]
     crits  = [s for s in data["secrets"] if "CRITICAL" in s["severity"]]
@@ -19793,7 +19516,8 @@ def _ssltls_scan_sync(hostname: str, progress_q: list) -> dict:
     # ── Step 4: HSTS check ────────────────────────
     progress_q.append("🔒 Checking HSTS header...")
     try:
-        r = requests.get(f"https://{hostname}", headers=_get_headers(), timeout=min(8,TIMEOUT), verify=False, allow_redirects=True)
+        r = requests.get(f"https://{hostname}", headers=_get_headers(),
+                         timeout=8, verify=False, allow_redirects=True)
         hsts = r.headers.get("Strict-Transport-Security", "")
         if hsts:
             results["hsts"] = True
@@ -19858,29 +19582,20 @@ async def cmd_ssltls(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "SSL/TLS scan")
-    _cancel_ev = asyncio.Event()
-    _cancel_flags.set(uid, _cancel_ev)
 
     msg = await update.effective_message.reply_text(
         f"🔒 *SSL/TLS Scan — `{host}`*\n\n⏳ Connecting...", parse_mode='Markdown')
     progress_q = []
-    _scan_t0 = time.monotonic()
 
     async def _prog():
         while True:
-            try:
-
-                await asyncio.sleep(2)
-
-            except asyncio.CancelledError:
-
-                return
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(
                         f"🔒 *SSL/TLS — `{host}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception as _e: logger.debug("Scan error: %s", _e)
+                except Exception: pass
 
     prog = asyncio.create_task(_prog())
     # ── Queue notification: show message if scan is already running ──
@@ -19896,7 +19611,6 @@ async def cmd_ssltls(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         prog.cancel()
         _active_scans.pop(uid, None)
-        _cancel_flags.pop(uid, None)
 
     grade = data["cert_grade"]
     grade_icon = {"A+": "🟢", "A": "🟢", "B": "🟡", "C": "🟡", "D": "🔴", "F": "🔴"}.get(grade, "⚪")
@@ -20214,8 +19928,8 @@ class ProxyManager:
                     entry.success = 1
                     logger.debug(f"✅ {proxy_url} ({proto}) → {speed:.0f}ms")
                     return entry
-            except Exception as _e:
-                logger.debug("Scan error: %s", _e)
+            except Exception:
+                pass
         return None
 
     # ─── Eviction & Sorting ──────────────────────────
