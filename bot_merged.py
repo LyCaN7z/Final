@@ -588,6 +588,19 @@ _RE_WEBPACK_CHUNK = re.compile(r'["`\']([a-f0-9]{8,20}\.[a-z0-9]+\.(?:js|css))["
 _RE_SRCSET_PART = re.compile(r'([^\s,]+)(?:\s+(?:\d+(?:\.\d+)?[wx]))?')
 _RE_SW_REGISTER = re.compile(r'''navigator\.serviceWorker\.register\s*\(\s*["`']([^`'"]+)["`']''')
 _RE_WIN_STATE   = re.compile(r'''window\.__(?:INITIAL_STATE|PRELOADED_STATE|NEXT_DATA|NUXT__)__\s*=\s*(\{.{20,5000}?\})''', re.DOTALL)
+
+# ── _PATCH_RE_* aliases — fix NameError in _extract_js_urls / _extract_css_urls ──
+# These functions were written expecting _PATCH_RE_* names but the re.compile()
+# calls above kept the original _RE_* names. Bridge them here.
+_PATCH_RE_JS_URL      = _RE_JS_FULL_URL    # full https?:// URLs inside JS bundles
+_PATCH_RE_NEXT_CHUNK  = _RE_NEXT_CHUNK     # /_next/static/... chunk paths
+_PATCH_RE_WEBPACK     = _RE_WEBPACK_CHUNK  # webpack content-hash filenames
+_PATCH_RE_SW          = _RE_SW_REGISTER    # navigator.serviceWorker.register() paths
+_PATCH_RE_WIN_STATE   = _RE_WIN_STATE      # window.__INITIAL_STATE__ / __NEXT_DATA__
+_PATCH_RE_JSONLD      = _RE_JSONLD_IMG     # JSON-LD image URLs
+_PATCH_RE_CSS_URL     = _RE_CSS_URL        # url(...) references inside CSS
+_PATCH_RE_CSS_IMPORT  = _RE_CSS_IMPORT     # @import statements inside CSS
+
 # Lazy-load attributes for <img> — extended for modern frameworks
 _LAZY_LOAD_ATTRS = (
     'src', 'data-src', 'data-lazy', 'data-original', 'data-lazy-src',
