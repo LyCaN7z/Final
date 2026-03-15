@@ -609,6 +609,18 @@ _LAZY_LOAD_ATTRS = (
     'data-background', 'data-poster', 'data-thumb', 'data-url',
     'data-large-image', 'data-zoom-image',
 )
+_LAZY_ATTRS = _LAZY_LOAD_ATTRS   # alias — fix NameError in extract_assets()
+
+# ── Downloadable file extensions — used in extract_assets() <a href> scanner ──
+_DOWNLOADABLE_EXTS = (
+    '.pdf', '.zip', '.tar', '.gz', '.bz2', '.xz', '.rar', '.7z', '.tar.gz',
+    '.mp4', '.mp3', '.avi', '.mov', '.mkv', '.webm', '.ogg', '.flac', '.wav',
+    '.exe', '.dmg', '.apk', '.deb', '.rpm', '.msi', '.pkg',
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp',
+    '.csv', '.json', '.xml', '.sql', '.sqlite', '.db',
+    '.woff', '.woff2', '.ttf', '.eot', '.otf',
+    '.iso', '.img', '.bin', '.torrent',
+)
 
 
 # ══════════════════════════════════════════════════
@@ -3462,6 +3474,10 @@ _VULN_PATHS = [
 
 _SEV_EMOJI = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","INFO":"⚪"}
 _SEV_ORDER = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
+# v2 aliases — fix NameError in scan/probe functions
+_SEV_EMOJI_V2  = _SEV_EMOJI
+_SEV_ORDER_V2  = _SEV_ORDER
+_WRITE_METHODS = {'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS'}
 _SEC_HEADERS = {
     "Strict-Transport-Security": ("HSTS",           "HIGH"),
     "Content-Security-Policy":   ("CSP",            "MEDIUM"),
@@ -3473,6 +3489,21 @@ _SEC_HEADERS = {
 _FAKE_SIGS = [
     b"404", b"not found", b"page not found",
     b"does not exist", b"no such file",
+]
+
+# Enhanced fake-404 signatures used by _is_fake_200_enhanced()
+# Superset of _FAKE_SIGS — byte strings, checked against lowercased HTML snippets
+_ENHANCED_FAKE_SIGS = [
+    b"404", b"not found", b"page not found",
+    b"does not exist", b"no such file",
+    b"page doesn't exist", b"page does not exist",
+    b"couldn't be found", b"could not be found",
+    b"no page found", b"error 404",
+    b"http 404", b"the page you",
+    b"we can't find", b"we couldn't find",
+    b"oops!", b"uh oh", b"something went wrong",
+    b"page has been moved", b"page has been deleted",
+    b"no longer available", b"this page is gone",
 ]
 
 # User-Agents rotation (avoid rate limiting) — 60+ UAs for better evasion (updated 2025/2026)
